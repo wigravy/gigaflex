@@ -1,0 +1,52 @@
+[
+  {
+    "case": "dirty_completion",
+    "accepted": false,
+    "error": "task 1: produce result left new uncommitted changes in the working tree: valuable-result.txt",
+    "agent_calls": 1,
+    "worktree_exists": false,
+    "deliverable_in_main": false,
+    "main_plan": "# Plan\n### Task 1: produce result\n- [ ] implement output\n- [ ] validate output\n"
+  },
+  {
+    "case": "deleted_requirement",
+    "accepted": true,
+    "error": null,
+    "agent_calls": 1,
+    "worktree_exists": false,
+    "deliverable_in_main": false,
+    "main_plan": "# Plan\n### Task 1: produce result\n- [x] implement output\n"
+  },
+  {
+    "case": "finalize_mutation",
+    "accepted": true,
+    "error": null,
+    "review_passes": 1,
+    "synthesis_calls": 0,
+    "final_head_was_reviewed": false,
+    "git_status": ""
+  },
+  {
+    "case": "dirty_synthesis",
+    "accepted": true,
+    "error": null,
+    "review_passes": 2,
+    "synthesis_calls": 1,
+    "final_head_was_reviewed": true,
+    "git_status": " M result.txt\n"
+  },
+  {
+    "case": "confirmed_stall",
+    "accepted": false,
+    "error": "review repair budget exhausted after terminal verification: 1 findings remain after 2 repair cycles",
+    "review_passes": 3,
+    "synthesis_calls": 2,
+    "final_head_was_reviewed": true,
+    "git_status": ""
+  },
+  {
+    "case": "changed_review_policy",
+    "first_review_calls": 1,
+    "new_policy_review_calls": 0
+  }
+]
