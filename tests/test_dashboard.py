@@ -10,6 +10,23 @@ from gigaflex.dashboard import ProgressDashboard, dashboard_paths
 
 
 class ProgressDashboardTest(unittest.TestCase):
+    def test_blocked_dashboard_shows_reason_saved_work_and_escaped_resume_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dashboard = ProgressDashboard(root / 'status.json', root / 'status.html',
+                                          name='demo', plan_file=None)
+            command = 'gigaflex "plan with spaces.md" --resume --resume-note "<resolved>"'
+            dashboard.awaiting_action('test service unavailable', command, '/repo/.git/recovery/abc')
+            self.assertEqual('blocked', dashboard.state['status'])
+            self.assertEqual(command, dashboard.state['resume_command'])
+            page = dashboard.html_path.read_text()
+            self.assertIn('Needs attention', page)
+            self.assertIn('Continue with saved work', page)
+            self.assertIn('test service unavailable', page)
+            self.assertIn('&lt;resolved&gt;', page)
+            self.assertNotIn('<resolved>', page)
+            self.assertNotIn('http-equiv="refresh"', page)
+
     def test_creates_json_and_self_contained_html_from_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

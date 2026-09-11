@@ -9,10 +9,64 @@ from gigaflex.plan import (
     file_has_uncompleted_checkbox,
     parse_plan,
     resolve_openspec_change,
+    task_plan_update_allowed,
 )
 
 
 class PlanParserTest(unittest.TestCase):
+    def test_task_updates_protect_everything_except_selected_tracking(self) -> None:
+        original = (
+            "# Plan\n## Context\nKeep the contract.\n"
+            "### Task 1: Previous\n- [x] Finished\nPreserve earlier prose.\n"
+            "### Task 2: Selected\n- [x] Already done\n- [ ] Implement\n- [ ] Validate\n"
+            "```md\n- [ ] Example\n```\n"
+            "- [ ] Explain the [ ] format\n"
+            "### Task 3: Later\n- [ ] Follow up\nPreserve later prose.\n"
+            "## Validation\npython3 verify.py\n"
+        )
+        selected = parse_plan(original).first_uncompleted_task()
+        completed = original.replace('- [ ] Implement', '- [x] Implement').replace(
+            '- [ ] Validate', '- [X] Validate',
+        )
+        self.assertTrue(task_plan_update_allowed(original, completed, selected))
+        changes = (
+            ('- [X] Validate\n', ''),
+            ('- [x] Implement', '- [x] Implement something easier'),
+            ('- [x] Already done', '- [ ] Already done'),
+            ('Keep the contract.', 'Changed contract.'),
+            ('Preserve earlier prose.', 'Changed earlier prose.'),
+            ('Preserve later prose.', 'Changed later prose.'),
+            ('- [ ] Follow up', '- [x] Follow up'),
+            ('- [ ] Example', '- [x] Example'),
+            ('- [ ] Explain the [ ] format', '- [x] Explain the [ ] format'),
+            ('python3 verify.py', 'true'),
+            ('### Task 2: Selected', '### Task 2: Renamed'),
+        )
+        for old, new in changes:
+            with self.subTest(change=(old, new)):
+                self.assertFalse(task_plan_update_allowed(original, completed.replace(old, new), selected))
+
+    def test_prose_tracking_allows_only_the_exact_marker_after_its_heading(self) -> None:
+        original = '## Задача 1: Анализ\n\nПроверить источники.\n## Задача 2: Отчёт\nПодготовить отчёт.\n'
+        selected = parse_plan(original, plan_format='openspec').first_uncompleted_task()
+        marker = '- [x] 1. Анализ\n'
+        valid = original.replace('## Задача 1: Анализ\n', '## Задача 1: Анализ\n' + marker)
+        self.assertTrue(task_plan_update_allowed(original, valid, selected, plan_format='openspec'))
+        for invalid in (
+            valid.replace('Проверить источники.', 'Пропустить источники.'),
+            valid.replace(marker, '- [x] Любая отметка\n'),
+            valid.replace(marker, marker + marker),
+            original + marker,
+        ):
+            with self.subTest(plan=invalid):
+                self.assertFalse(task_plan_update_allowed(original, invalid, selected, plan_format='openspec'))
+
+    def test_tracking_boundary_uses_source_lines_when_title_is_inside_task(self) -> None:
+        original = '### Task 1: Build\n# Plan\n- [ ] Implement\n- [ ] Validate\n'
+        selected = parse_plan(original).first_uncompleted_task()
+        self.assertTrue(task_plan_update_allowed(original, original.replace('[ ]', '[x]'), selected))
+        self.assertFalse(task_plan_update_allowed(original, original.replace('# Plan', '# Changed'), selected))
+
     def test_parses_tasks_and_ignores_fenced_checkboxes(self) -> None:
         plan = parse_plan(
             """# Plan: Demo

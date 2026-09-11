@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import shlex
 import sys
 from typing import Optional
 
@@ -14,7 +15,7 @@ from .config import (
     init_project_prompt_templates,
     load_config,
 )
-from .checkpoint import RunCheckpoint, checkpoint_path
+from .checkpoint import ResumeError, RunCheckpoint, checkpoint_path
 from .dashboard import ProgressDashboard, dashboard_paths
 from .executor import GigaCodeExecutor
 from .git import (
@@ -105,6 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-model", help="GigaCode model for read-only review agents; falls back to task model")
     parser.add_argument("--finalize-model", help="GigaCode model for finalize; falls back to review/task model")
     parser.add_argument("--tasks-only", action="store_true", help="run task phase only")
+    continuation = parser.add_mutually_exclusive_group()
+    continuation.add_argument("--resume", action="store_true", help="continue a stopped run with its saved task work")
+    continuation.add_argument("--restart", action="store_true", help="restart from the current checkout; keep old recovery bundles for inspection")
+    parser.add_argument("--resume-note", default="", help="operator context to include when resuming")
     parser.add_argument("--review", action="store_true", help="skip tasks and run review phase")
     parser.add_argument("--max-iterations", type=int, help="maximum task iterations")
     parser.add_argument(
@@ -365,6 +370,8 @@ def find_interactively_created_plan(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    launch_directory = Path.cwd()
+    launch_arguments = list(sys.argv[1:] if argv is None else argv)
     local_fallback_written: list[Path] = []
     local_fallback_started_clean = False
     try:
@@ -393,6 +400,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
     else:
         args.jira_task = ""
+    if args.resume_note and not args.resume:
+        print("error: --resume-note requires --resume", file=sys.stderr)
+        return 2
+    if (args.resume or args.restart) and (args.plan or args.init or args.init_prompts or args.init_git):
+        print("error: --resume/--restart require an existing execution run", file=sys.stderr)
+        return 2
     if args.openspec and args.plan_file:
         print("error: --openspec cannot be combined with a markdown plan file", file=sys.stderr)
         return 2
@@ -935,6 +948,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         plan_context_files=plan_source.context_paths if plan_source else (),
         task_completion_retries=cfg.retry_count,
         allow_dirty=cfg.allow_dirty,
+        resume=args.resume,
+        resume_note=args.resume_note,
     )
     review_worktrees = (
         None
@@ -967,21 +982,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             ignored_paths=orchestration_paths,
         )
     )
-    checkpoint = (
-        None
-        if args.dry_run
-        else RunCheckpoint(
-            checkpoint_file,
-            git,
-            identity=(
-                f"{plan_source.kind}:{plan_source.source_path.resolve()}"
-                if plan_source is not None
-                else f"review:{git.current_branch()}"
-            ),
-            base_commit=run_baseline.base_commit if run_baseline is not None else "",
-            ignored_paths=orchestration_paths,
-            diagnostic=log.diagnostic,
+    try:
+        checkpoint = make_checkpoint(
+            args, checkpoint_file, git, plan_source, run_baseline, orchestration_paths, log,
         )
+    except ResumeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        dashboard.fail(str(exc))
+        return 1
+    resume_command = continuation_command(
+        launch_directory, launch_arguments, run_baseline.base_commit if run_baseline else "",
     )
 
     exit_code = 0
@@ -1029,22 +1039,37 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"ready to archive with: openspec archive {plan_source.name}")
         if not args.dry_run:
             dashboard.complete()
-    except KeyboardInterrupt:
-        print("\ninterrupted", file=sys.stderr)
+    except KeyboardInterrupt as exc:
+        detail = str(exc)
+        print(f"\ninterrupted{': ' + detail if detail else ''}", file=sys.stderr)
         exit_code = 130
         run_status = "interrupted"
-        failure_reason = "run interrupted"
+        failure_reason = detail or "run interrupted"
         failure_phase = str(dashboard.state.get("phase", "unknown"))
         if not args.dry_run:
             log.section("failure")
             log.write(
                 f"phase: {failure_phase}\nreason: {failure_reason}\n"
             )
-            dashboard.interrupt()
+            record_stopped_run(checkpoint, exc, failure_phase, resume_command, log, dashboard, interrupted=True)
+    except ResumeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        exit_code = 1
+        run_status = "blocked" if checkpoint is not None and checkpoint.blocked else "failed"
+        failure_reason = str(exc)
+        failure_phase = str(dashboard.state.get("phase", "unknown"))
+        if not args.dry_run:
+            saved = checkpoint.blocked if checkpoint is not None else {}
+            recovery = saved.get("task_recovery") or {}
+            location = str(recovery.get("directory") or recovery.get("original_worktree") or "")
+            if saved:
+                dashboard.awaiting_action(str(exc), str(saved.get("resume_command", "")), location)
+            else:
+                dashboard.fail(str(exc))
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         exit_code = 1
-        run_status = "failed"
+        run_status = "blocked"
         failure_reason = str(exc)
         failure_phase = str(dashboard.state.get("phase", "unknown"))
         if not args.dry_run:
@@ -1057,7 +1082,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "session=runner event=failed "
                 f"phase={failure_phase!r} error={failure_reason!r}"
             )
-            dashboard.fail(str(exc))
+            record_stopped_run(checkpoint, exc, failure_phase, resume_command, log, dashboard)
     finally:
         if not args.dry_run:
             statistics.finish(
@@ -1076,6 +1101,63 @@ def main(argv: Optional[list[str]] = None) -> int:
         return exit_code
     print(f"progress log: {progress_file}")
     return 0
+
+
+def make_checkpoint(args, path, git, plan_source, baseline, ignored_paths, log):
+    if args.dry_run:
+        return None
+    return RunCheckpoint(
+        path, git,
+        identity=(f"{plan_source.kind}:{plan_source.source_path.resolve()}"
+                  if plan_source is not None else f"review:{git.current_branch()}"),
+        base_commit=baseline.base_commit if baseline is not None else "",
+        ignored_paths=ignored_paths, diagnostic=log.diagnostic,
+        restart=args.restart,
+    )
+
+
+def continuation_command(directory: Path, arguments: list[str], base_commit: str = "") -> str:
+    filtered = []
+    skip_note = False
+    for argument in arguments:
+        if skip_note:
+            skip_note = False
+        elif argument in ({"--resume-note", "--base-ref", "--default-branch"} if base_commit else {"--resume-note"}):
+            skip_note = True
+        elif base_commit and argument.startswith(("--base-ref=", "--default-branch=")):
+            continue
+        elif argument not in {"--resume", "--restart"} and not argument.startswith("--resume-note="):
+            filtered.append(argument)
+    if base_commit:
+        filtered.extend(("--base-ref", base_commit))
+    return f"cd {shlex.quote(str(directory))} && {shlex.join(['gigaflex', *filtered, '--resume'])}"
+
+
+def record_stopped_run(checkpoint, exc, phase, command, log, dashboard, *, interrupted=False):
+    recovery = getattr(exc, "task_recovery", None)
+    reason = str(exc) or "run interrupted"
+    if recovery and recovery.get("original_dirty_paths") and "--allow-dirty" not in shlex.split(command):
+        command += " --allow-dirty"
+    try:
+        if checkpoint is not None:
+            checkpoint.mark_blocked(reason, phase, command, recovery)
+    except OSError as save_error:
+        print(f"could not save continuation state: {save_error}; inspect the saved task work manually", file=sys.stderr)
+        command = ""
+    location = ""
+    if recovery:
+        location = str(recovery.get("directory") or recovery.get("original_worktree") or "")
+    dashboard.awaiting_action(reason, command, location, interrupted=interrupted)
+    lines = ["Run interrupted." if interrupted else "Needs attention: automatic recovery could not complete the run."]
+    if location:
+        lines.append(f"Saved work: {location}")
+    if command:
+        lines.extend(("Resolve the reported cause, then continue with saved work:", command,
+                      'Optional context: add --resume-note "what you resolved or clarified"'))
+    lines.extend((f"Dashboard: {dashboard.html_path.resolve()}", f"Progress log: {log.path.resolve()}"))
+    notice = "\n".join(lines) + "\n"
+    print(notice, end="", file=sys.stderr)
+    log.write(notice)
 
 
 if __name__ == "__main__":

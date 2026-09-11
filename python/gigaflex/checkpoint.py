@@ -14,6 +14,10 @@ CHECKPOINT_VERSION = 1
 PHASE_ORDER = ("tasks", "review", "finalize")
 
 
+class ResumeError(RuntimeError):
+    """A saved run cannot be resumed without resolving its state mismatch."""
+
+
 @dataclass(frozen=True)
 class RepositoryState:
     head: str
@@ -30,6 +34,7 @@ class RunCheckpoint:
         base_commit: str,
         ignored_paths: tuple[Path, ...] = (),
         diagnostic: Callable[[str], None] = lambda _line: None,
+        restart: bool = False,
     ) -> None:
         self.path = path
         self.git = git
@@ -38,9 +43,38 @@ class RunCheckpoint:
         self.ignored_paths = ignored_paths
         self.diagnostic = diagnostic
         self._data = self._load()
+        if restart:
+            stopped_phase = self.blocked.get("phase")
+            self._data.pop("blocked", None)
+            if stopped_phase in PHASE_ORDER:
+                self.invalidate_from(stopped_phase)
+            else:
+                self._write()
         if not self._matches_run():
+            if self.blocked:
+                raise ResumeError(f"saved stopped run belongs to another plan or base: {self.path}")
             self._data = self._empty_data()
             self._write()
+
+    @property
+    def blocked(self) -> dict[str, object]:
+        value = self._data.get("blocked")
+        return dict(value) if isinstance(value, dict) else {}
+
+    def mark_blocked(
+        self, reason: str, phase: str, resume_command: str,
+        task_recovery: dict[str, object] | None = None,
+    ) -> None:
+        recovery = task_recovery or self.blocked.get("task_recovery")
+        self._data["blocked"] = {
+            "reason": reason, "phase": phase, "resume_command": resume_command,
+            "task_recovery": recovery, "updated_at": _timestamp(),
+        }
+        self._write()
+
+    def clear_blocked(self) -> None:
+        self._data.pop("blocked", None)
+        self._write()
 
     def current_state(self) -> RepositoryState:
         with tempfile.TemporaryDirectory(prefix="gigaflex-checkpoint-") as tmp:

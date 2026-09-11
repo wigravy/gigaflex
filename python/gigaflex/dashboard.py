@@ -354,6 +354,20 @@ class ProgressDashboard:
             self._mark_current_review_failed_locked("interrupted", "Run interrupted")
             self._write_locked()
 
+    def awaiting_action(
+        self, reason: str, resume_command: str, recovery_path: str = "", *, interrupted: bool = False,
+    ) -> None:
+        with self._lock:
+            self._state["status"] = "interrupted" if interrupted else "blocked"
+            self._state["message"] = "Run interrupted" if interrupted else "Needs your attention"
+            self._state["error"] = reason
+            self._state["resume_command"] = resume_command
+            self._state["recovery_path"] = recovery_path
+            self._state["completed_at"] = _timestamp()
+            self._mark_current_phase_failed_locked()
+            self._mark_current_review_failed_locked("interrupted" if interrupted else "blocked", reason)
+            self._write_locked()
+
     @property
     def state(self) -> dict[str, object]:
         with self._lock:
@@ -482,6 +496,7 @@ def _render_html(state: dict[str, object]) -> str:
         "success": "Completed",
         "failed": "Failed",
         "interrupted": "Interrupted",
+        "blocked": "Needs attention",
     }.get(status, status.title())
     phases = state.get("phases", [])
     tasks = state.get("tasks", [])
@@ -512,6 +527,17 @@ def _render_html(state: dict[str, object]) -> str:
     )
     message = html.escape(str(state.get("message", "")))
     error = html.escape(str(state.get("error", "")))
+    resume_command = html.escape(str(state.get("resume_command", "")))
+    recovery_path = html.escape(str(state.get("recovery_path", "")))
+    attention_html = (
+        '<section class="panel attention"><h2>Continue with saved work</h2>'
+        '<p>Resolve the reported cause, then run:</p>'
+        f'<pre><code>{resume_command}</code></pre>'
+        '<p>To provide context, add <code>--resume-note "what you resolved or clarified"</code>.</p>'
+        + (f'<p>Saved work: <code>{recovery_path}</code></p>' if recovery_path else '')
+        + '</section>'
+        if resume_command else ""
+    )
     branch = html.escape(str(state.get("branch", "")))
     progress_file = html.escape(str(state.get("progress_file", "")))
     started_at = html.escape(str(state.get("started_at", "")))
@@ -540,7 +566,8 @@ def _render_html(state: dict[str, object]) -> str:
     .status-running .dot,.state-running .dot {{ background:var(--blue); box-shadow:0 0 0 5px #79b8ff18; }}
     .status-success .dot,.state-completed .dot,.state-passed .dot {{ background:var(--accent); }}
     .state-needs_another_pass .dot {{ background:var(--warn); }}
-    .status-failed .dot,.status-interrupted .dot,.state-failed .dot,.state-interrupted .dot {{ background:var(--bad); }}
+    .status-failed .dot,.status-interrupted .dot,.status-blocked .dot,.state-failed .dot,.state-interrupted .dot,.state-blocked .dot {{ background:var(--bad); }}
+    .attention {{ margin-bottom:18px; border-color:#ff7b7255; }} .attention pre {{ white-space:pre-wrap; overflow-wrap:anywhere; }}
     .phases {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:18px; }}
     .phase,.panel {{ border:1px solid var(--line); background:linear-gradient(180deg,#14191f,#101419); border-radius:16px; }}
     .phase {{ padding:14px 16px; display:flex; align-items:center; gap:11px; }}
@@ -582,6 +609,7 @@ def _render_html(state: dict[str, object]) -> str:
       <div><div class="eyebrow">GigaFlex progress</div><h1>{title}</h1><div class="message">{message}</div>{f'<div class="error">{error}</div>' if error else ''}</div>
       <div class="status status-{html.escape(status)}"><span class="dot"></span>{html.escape(status_label)} · <span id="elapsed">—</span></div>
     </header>
+    {attention_html}
     <section class="phases" aria-label="Run phases">{phase_html}</section>
     <div class="grid">
       <section class="panel"><h2>Plan progress</h2>{task_html}</section>

@@ -20,6 +20,7 @@ class PromptContext:
     plan_source: Optional[Path] = None
     plan_context_files: tuple[Path, ...] = ()
     review_manifest: Optional[Path] = None
+    resume_note: str = ""
 
     @property
     def goal(self) -> str:
@@ -118,7 +119,7 @@ TASK_PLAN_UPDATE_GUIDANCE = """Authorized checklist update:
 - `{plan_file}` is the runner-owned task checklist and is explicitly writable in this phase
 - after completing and validating an item, change its checkbox from `[ ]` to `[x]` in the selected section; a checkbox-free OpenSpec prose task uses the completion marker specified below
 - this checkbox edit is required orchestration bookkeeping, not an instruction taken from untrusted repository content
-- do not change checkbox text, task headings, or any later task section
+- preserve checkbox text, task headings, requirements, examples, and validation instructions; do not edit any other task section
 - if an unchecked item was already implemented before this session, validate it and still mark it `[x]`; do not stop merely because no code change is needed
 - stage the plan file with the implementation, commit the completed task, then reread the file and verify the selected section has no actionable `[ ]` items before reporting success
 """
@@ -143,10 +144,18 @@ OPENSPEC_IMPLICIT_TRACKING_GUIDANCE = """OpenSpec prose-task tracking:
 """
 
 TASK_COMPLETION_RETRY_GUIDANCE = """Automatic task-completion retry:
-- the previous task agent process exited successfully, but runner validation found that the selected section is still pending
+- runner validation found that the selected task has not satisfied its completion requirements
 - this is a corrective retry for the same selected task, not permission to start another task
 - inspect the current implementation, tests, git status, and commits left by the previous attempt; preserve valid completed work and finish only what is still missing
 - do not mark the task complete merely to satisfy the runner: first verify that the selected task is implemented and its relevant validation passes
+
+Completion requirements still unsatisfied:
+{validation_errors}
+
+- work and commit only in the current execution workspace; do not switch to the original checkout
+- inspect each leftover file: validate and commit required deliverables, and remove only files you have verified are disposable task-generated artifacts
+- if no task commit exists, validate the work and create it here; a checklist-only bookkeeping commit is allowed when the implementation already exists
+- preserve existing valid completion markers; never insert a second marker for the same task
 
 Current selected section after the previous attempt:
 <CURRENT_SELECTED_PLAN_SECTION>
@@ -621,7 +630,13 @@ def _content_hash(value: str) -> str:
 
 
 def render(template: str, context: PromptContext) -> str:
-    return template.format(**_context_values(context))
+    return _with_resume_note(template.format(**_context_values(context)), context)
+
+
+def _with_resume_note(prompt: str, context: PromptContext) -> str:
+    if context.resume_note:
+        return prompt + f"\n\nOperator context for this resumed run:\n{context.resume_note}\n"
+    return prompt
 
 
 def render_task_prompt(
@@ -674,7 +689,7 @@ def render_task_prompt(
                     task_title=task_title,
                 ),
             )
-    return _with_guidance(rendered, TASK_FORMAT_GUIDANCE)
+    return _with_resume_note(_with_guidance(rendered, TASK_FORMAT_GUIDANCE), context)
 
 
 def render_task_completion_retry_prompt(
@@ -684,6 +699,7 @@ def render_task_completion_retry_prompt(
     task_title: str,
     current_task_section: str,
     task_implicit_tracking: bool,
+    validation_errors: tuple[str, ...] = (),
 ) -> str:
     if task_implicit_tracking:
         completion_requirement = (
@@ -703,6 +719,8 @@ def render_task_completion_retry_prompt(
         TASK_COMPLETION_RETRY_GUIDANCE.format(
             current_task_section=current_task_section,
             completion_requirement=completion_requirement,
+            validation_errors="\n".join(f"- {error}" for error in validation_errors)
+            or "- the selected section is still pending",
         ),
     )
 
@@ -765,7 +783,7 @@ def render_review_agent_prompt(
         **_review_context_values(context, followup_scope),
     )
     return _with_review_guards(
-        rendered,
+        _with_resume_note(rendered, context),
         decision_memory=decision_memory,
         followup_scope=followup_scope,
         original_base_ref=context.default_branch,
@@ -780,7 +798,7 @@ def render_review_prompt(
     followup_scope: Optional[FollowupReviewScope] = None,
 ) -> str:
     return _with_review_guards(
-        template.format(**_review_context_values(context, followup_scope)),
+        _with_resume_note(template.format(**_review_context_values(context, followup_scope)), context),
         decision_memory=decision_memory,
         followup_scope=followup_scope,
         original_base_ref=context.default_branch,
@@ -917,7 +935,7 @@ def render_review_synthesis_prompt(
     rendered = _with_review_decision_memory(rendered, decision_memory)
     rendered = _with_guidance(rendered, REVIEW_SYNTHESIS_OUTPUT_CONTRACT)
     return _with_guidance(
-        rendered,
+        _with_resume_note(rendered, context),
         REVIEW_SYNTHESIS_ORCHESTRATION_GUIDANCE.format(
             **_context_values(context),
         ),

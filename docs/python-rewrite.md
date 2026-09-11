@@ -13,11 +13,24 @@
 - Commit newly created plan files by default when running inside a git
   repository.
 - Commit completed plan moves after a successful full run.
-- Install `.gitignore` entries for `.DS_Store`, `.gigaflex/progress/`, and
-  `.gigaflex/worktrees/` during project initialization.
+- Install `.gitignore` entries for `.DS_Store` and `/.gigaflex/` during
+  project initialization.
 - Optionally initialize a missing git repository with `--init-git` and commit
   the initial working tree before execution.
-- Run one task section per agent iteration.
+- Run one task section per agent iteration in an isolated snapshot worktree.
+  Promote validated linear commits; adopt task-touched dirty input files while
+  preserving untouched user changes.
+- Protect all plan content except forward tracking updates for the selected task.
+- Correct protected-plan/context violations by restoring the original contract
+  in the isolated worktree and requiring revalidation within the retry budget.
+- Save unpromoted task commits, staged state, tracked files, and non-ignored
+  untracked files to a verified recovery bundle before cleanup. If saving fails,
+  retain the original worktree. Ignored untracked and external files are excluded.
+  Populated nested repositories also require retaining the worktree.
+- Persist stopped-run recovery locations and expose the cause and continuation
+  command in the terminal and dashboard. Resume saved task state with `--resume`
+  after checking branch, HEAD, files, and index; `--resume-note` supplies operator
+  context. `--restart` explicitly uses the current checkout and retains old work.
 - Stream agent output to terminal and a progress log.
 - Maintain a self-contained live HTML dashboard and a machine-readable JSON
   status file beside each progress log.
@@ -43,8 +56,9 @@
   delay, and review worker limit.
 - Classify transient and rate-limit executor failures with configurable
   patterns, including optional longer waits before rate-limit retries.
-- Retry logically incomplete task completions with a corrective prompt after
-  restoring protected plan/OpenSpec state.
+- Retry pending task tracking, missing commits, and uncommitted task outputs
+  in the same workspace with specific completion errors. Preserve the original
+  requirements; process retries restore checklist state only before a commit.
 - Retry `Model not found` failures without the configured model and use the
   GigaCode default model for later calls.
 - Validate git repository state, capture the launch branch and exact base commit,

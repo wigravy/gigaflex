@@ -1462,6 +1462,7 @@ print(json.dumps({
             self.assertTrue(dashboard_file.is_file())
 
     def test_interrupted_run_writes_statistics_file_with_absolute_path(self) -> None:
+        recovery_notice = 'task recovery saved to: /tmp/recovery-test (see README.txt)'
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home_tmp:
             tmp_path = Path(tmp)
             home = Path(home_tmp)
@@ -1479,7 +1480,7 @@ print(json.dumps({
                 stderr = io.StringIO()
                 with (
                     patch.dict(os.environ, {"HOME": str(home)}),
-                    patch("gigaflex.cli.Runner.run", side_effect=KeyboardInterrupt),
+                    patch("gigaflex.cli.Runner.run", side_effect=KeyboardInterrupt(recovery_notice)),
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
@@ -1503,6 +1504,9 @@ print(json.dumps({
             self.assertIn("status: interrupted", stdout.getvalue())
             self.assertIn(f"statistics: {stats_file}", stdout.getvalue())
             self.assertIn("interrupted", stderr.getvalue())
+            self.assertIn(recovery_notice, stderr.getvalue())
+            self.assertEqual(recovery_notice, stats['failure_reason'])
+            self.assertIn(recovery_notice, (tmp_path / '.gigaflex/progress/progress-review.txt').read_text())
 
     def test_failed_run_writes_reason_to_progress_and_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home_tmp:
@@ -1541,7 +1545,7 @@ print(json.dumps({
             stats = json.loads(stats_file.read_text(encoding="utf-8"))
             progress_text = progress.read_text(encoding="utf-8")
             self.assertEqual(1, code)
-            self.assertEqual("failed", stats["status"])
+            self.assertEqual("blocked", stats["status"])
             self.assertEqual("review crashed", stats["failure_reason"])
             self.assertEqual("startup", stats["failure_phase"])
             self.assertIn("=== failure", progress_text)

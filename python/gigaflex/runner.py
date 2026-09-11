@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 from typing import Callable, Iterator, Optional
 
-from .checkpoint import RunCheckpoint
+from .checkpoint import ResumeError, RunCheckpoint
 from .dashboard import ProgressDashboard
 from .executor import ExecResult, GigaCodeExecutor
 from .git import (
@@ -16,7 +16,13 @@ from .git import (
     TaskWorktree,
     TaskWorktreeManager,
 )
-from .plan import Plan, Task, file_has_uncompleted_checkbox, parse_plan, parse_plan_file
+from .plan import (
+    Plan,
+    Task,
+    file_has_uncompleted_checkbox,
+    parse_plan_file,
+    task_plan_update_allowed,
+)
 from .progress import ProgressLog
 from .prompts import (
     DEFAULT_PROMPTS,
@@ -80,6 +86,26 @@ class RunOptions:
     plan_context_files: tuple[Path, ...] = ()
     task_completion_retries: int = 1
     allow_dirty: bool = False
+    resume: bool = False
+    resume_note: str = ""
+
+
+@dataclass(frozen=True)
+class TaskCompletionStatus:
+    errors: tuple[str, ...] = ()
+    repairable: bool = True
+
+    @property
+    def complete(self) -> bool:
+        return not self.errors
+
+
+@dataclass(frozen=True)
+class TaskBaseline:
+    plan: str
+    context: dict[Path, bytes]
+    head: str
+    dirty: set[Path]
 
 
 class Runner:
@@ -109,11 +135,27 @@ class Runner:
         self.checkpoint = checkpoint
         self._active_cwd: Optional[Path] = None
         self._latest_review_verification_records: tuple[ReviewDecisionRecord, ...] = ()
+        self._pending_task_recovery: Optional[dict[str, object]] = None
 
     def run(self) -> None:
         if self.options.dry_run:
             self.print_prompts()
             return
+        blocked = self.checkpoint.blocked if self.checkpoint is not None else {}
+        if self.options.resume and not blocked:
+            raise ResumeError("no saved stopped run was found for this plan; run without --resume")
+        if blocked:
+            if not self.options.resume:
+                raise ResumeError(
+                    f"this run has saved unfinished work; continue with: {blocked.get('resume_command', '--resume')}"
+                )
+            recovery = blocked.get("task_recovery")
+            if recovery:
+                if self.options.review_only or self.task_worktrees is None:
+                    raise ResumeError("saved task work must be resumed in task mode")
+                self._pending_task_recovery = dict(recovery)
+            elif self.checkpoint is not None:
+                self.checkpoint.clear_blocked()
         if not self.options.review_only:
             had_uncompleted_work = self._has_uncompleted_work()
             if self.checkpoint is not None and had_uncompleted_work:
@@ -187,6 +229,8 @@ class Runner:
             raise ValueError("plan file is required for task execution")
         self._validate_plan_has_tasks()
         if not self._has_uncompleted_work():
+            if self._pending_task_recovery:
+                raise ResumeError("the plan no longer contains the saved pending task; saved work has been retained")
             self.log.section("tasks")
             self.log.write("plan already has no uncompleted task sections\n")
             return
@@ -206,11 +250,28 @@ class Runner:
             if self.task_worktrees is None:
                 result = self._execute_task_iteration(selected_task)
             else:
-                with self.task_worktrees.create(task_label) as workspace:
+                original_plan = self.options.plan_file.read_text(encoding="utf-8")
+                original_context = self._plan_context_snapshot()
+                task_context = (
+                    self.task_worktrees.resume(task_label, self._pending_task_recovery)
+                    if self._pending_task_recovery else self.task_worktrees.create(task_label)
+                )
+                with task_context as workspace:
+                    baseline = TaskBaseline(
+                        original_plan,
+                        {workspace.path / path.resolve().relative_to(workspace.repo_root): content
+                         for path, content in original_context.items()},
+                        workspace.snapshot_commit, set(),
+                    ) if workspace.resumed else None
                     with self._use_task_workspace(workspace):
-                        result = self._execute_task_iteration(selected_task)
+                        result = self._execute_task_iteration(
+                            selected_task, baseline, resumed=workspace.resumed,
+                        )
                         task_head = self._git().head_commit()
                     workspace.promote(task_head)
+                    self._pending_task_recovery = None
+                    if self.checkpoint is not None:
+                        self.checkpoint.clear_blocked()
             if self.dashboard is not None:
                 self.dashboard.task_finished()
             if result.signal == ALL_TASKS_DONE and not self._has_uncompleted_work():
@@ -220,13 +281,15 @@ class Runner:
             time.sleep(self.options.delay_seconds)
         raise RuntimeError(f"max task iterations reached: {self.options.max_iterations}")
 
-    def _execute_task_iteration(self, selected_task: Task) -> ExecResult:
+    def _execute_task_iteration(
+        self, selected_task: Task, baseline: Optional[TaskBaseline] = None, *, resumed: bool = False,
+    ) -> ExecResult:
         assert self.options.plan_file is not None
         context = self._context()
-        plan_before = self.options.plan_file.read_text(encoding="utf-8")
-        context_before = self._plan_context_snapshot()
-        head_before = self._git().head_commit()
-        dirty_before = self._uncommitted_paths()
+        plan_before = baseline.plan if baseline else self.options.plan_file.read_text(encoding="utf-8")
+        context_before = baseline.context if baseline else self._plan_context_snapshot()
+        head_before = baseline.head if baseline else self._git().head_commit()
+        dirty_before = baseline.dirty if baseline else self._uncommitted_paths()
         prompt = render_task_prompt(
             self.options.prompts.task,
             context,
@@ -236,6 +299,18 @@ class Runner:
             selected_task.has_implicit_tracking,
         )
         task_label = self._task_label(selected_task)
+        if resumed:
+            status = self._task_completion_status(selected_task, plan_before, context_before, head_before, dirty_before)
+            if status.complete and not self.options.resume_note:
+                self.log.write(f"saved task {task_label} already satisfies completion checks; retrying promotion\n")
+                return ExecResult(output="saved task completion verified", returncode=0)
+            if not status.repairable:
+                self._restore_task_contract(plan_before, context_before)
+            prompt += (
+                "\nResuming saved task work after an interrupted or blocked run.\n"
+                "Inspect existing commits and staged/unstaged files; preserve valid work.\n"
+                "Verify the entire original selected task before marking it complete and committing.\n"
+            )
         result = self._run_task_agent(
             prompt,
             retry_guard=(
@@ -249,14 +324,13 @@ class Runner:
             ),
         )
         self._prefix_new_commits(head_before, f"task {task_label}")
-        self._accept_task_result_or_raise(
-            result,
-            selected_task,
-            plan_before,
-            context_before,
-            head_before,
-            dirty_before,
-        )
+        if not self._can_restore_contract_for_retry(
+            selected_task, plan_before, context_before, head_before, dirty_before,
+            self.options.task_completion_retries,
+        ):
+            self._accept_task_result_or_raise(
+                result, selected_task, plan_before, context_before, head_before, dirty_before,
+            )
         completion_retries = 0
         while (
             completion_retries < max(0, self.options.task_completion_retries)
@@ -264,9 +338,21 @@ class Runner:
                 selected_task,
                 plan_before,
                 context_before,
+                head_before,
+                dirty_before,
             )
         ):
             completion_retries += 1
+            status = self._task_completion_status(
+                selected_task, plan_before, context_before, head_before, dirty_before,
+            )
+            validation_errors = status.errors
+            if not status.repairable:
+                self._restore_task_contract(plan_before, context_before)
+                validation_errors += (
+                    "The original plan and read-only context were restored. Verify ALL selected "
+                    "requirements again, restore completion tracking only after validation, and commit the correction.",
+                )
             current_task = self._matching_task(self._parse_plan_file(), selected_task)
             assert current_task is not None
             self.log.section(
@@ -287,7 +373,8 @@ class Runner:
                 selected_task.number,
                 selected_task.title,
                 current_task.section,
-                selected_task.has_implicit_tracking,
+                current_task.has_implicit_tracking,
+                validation_errors=validation_errors,
             )
             result = self._run_task_agent(
                 retry_prompt,
@@ -305,14 +392,13 @@ class Runner:
                 retry_head_before,
                 f"task completion retry {completion_retries}: {task_label}",
             )
-            self._accept_task_result_or_raise(
-                result,
-                selected_task,
-                plan_before,
-                context_before,
-                head_before,
-                dirty_before,
-            )
+            if not self._can_restore_contract_for_retry(
+                selected_task, plan_before, context_before, head_before, dirty_before,
+                self.options.task_completion_retries - completion_retries,
+            ):
+                self._accept_task_result_or_raise(
+                    result, selected_task, plan_before, context_before, head_before, dirty_before,
+                )
         self._validate_completed_task_iteration(
             selected_task,
             plan_before,
@@ -746,6 +832,7 @@ class Runner:
             plan_kind=self.options.plan_kind,
             plan_source=self.options.plan_source,
             plan_context_files=self.options.plan_context_files,
+            resume_note=self.options.resume_note,
         )
 
     def _parse_plan_file(self) -> Plan:
@@ -768,6 +855,46 @@ class Runner:
             return plan.has_uncompleted_tasks()
         return file_has_uncompleted_checkbox(self.options.plan_file)
 
+    def _task_completion_status(
+        self,
+        selected_task: Task,
+        plan_before: str,
+        context_before: dict[Path, bytes],
+        head_before: str,
+        dirty_before: set[Path],
+    ) -> TaskCompletionStatus:
+        assert self.options.plan_file is not None
+        label = f"task {self._task_label(selected_task)}"
+        try:
+            plan_after = self.options.plan_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return TaskCompletionStatus((f"{label} removed or made its plan unreadable",), False)
+        if not task_plan_update_allowed(
+            plan_before, plan_after, selected_task, plan_format=self.options.plan_kind,
+        ):
+            return TaskCompletionStatus(
+                (f"{label} modified protected plan content: requirements, headings, "
+                 "or tracking outside the selected section",),
+                False,
+            )
+        changed_context = self._changed_plan_context(context_before)
+        if changed_context:
+            paths = ", ".join(self._display_path(path) for path in changed_context)
+            return TaskCompletionStatus(
+                (f"{label} modified read-only plan context: {paths}",), False,
+            )
+        completed_task = self._matching_task(self._parse_plan_file(), selected_task)
+        errors = []
+        if completed_task is None or not completed_task.complete:
+            errors.append(f"{label} did not complete its selected plan section")
+        if self._git().head_commit() == head_before:
+            errors.append(f"{label} completed without creating a commit")
+        new_dirty = self._uncommitted_paths() - dirty_before
+        if new_dirty and not self.options.allow_dirty:
+            paths = ", ".join(self._display_path(path) for path in sorted(new_dirty))
+            errors.append(f"{label} left new uncommitted changes in the working tree: {paths}")
+        return TaskCompletionStatus(tuple(errors))
+
     def _validate_completed_task_iteration(
         self,
         selected_task: Task,
@@ -777,43 +904,20 @@ class Runner:
         dirty_before: set[Path],
         completion_retries: int = 0,
     ) -> None:
-        assert self.options.plan_file is not None
-        plan = self._parse_plan_file()
-        completed_task = self._matching_task(plan, selected_task)
-        self._validate_later_tasks_unchanged(selected_task, plan_before, plan)
-        changed_context = self._changed_plan_context(context_before)
-        if changed_context:
-            paths = ", ".join(self._display_path(path) for path in changed_context)
-            raise RuntimeError(
-                f"task {self._task_label(selected_task)} modified read-only plan context: {paths}"
-            )
-        if completed_task is None or not completed_task.complete:
-            retry_suffix = (
-                f" after {completion_retries} automatic completion "
-                f"{'retry' if completion_retries == 1 else 'retries'}"
-                if completion_retries
-                else ""
-            )
-            raise RuntimeError(
-                f"task {self._task_label(selected_task)} did not complete its selected plan section"
-                f"{retry_suffix}"
-            )
-
-        git = self._git()
-        if git.head_commit() == head_before:
-            raise RuntimeError(
-                f"task {self._task_label(selected_task)} completed without creating a commit"
-            )
+        status = self._task_completion_status(
+            selected_task, plan_before, context_before, head_before, dirty_before,
+        )
+        if status.errors:
+            errors = list(status.errors)
+            if completion_retries:
+                errors[0] += (
+                    f" after {completion_retries} automatic completion "
+                    f"{'retry' if completion_retries == 1 else 'retries'}"
+                )
+            raise RuntimeError("; ".join(errors))
         new_dirty = self._uncommitted_paths() - dirty_before
         if new_dirty:
-            if self.options.allow_dirty:
-                self._log_allowed_dirty("task", new_dirty, selected_task)
-                return
-            paths = ", ".join(self._display_path(path) for path in sorted(new_dirty))
-            raise RuntimeError(
-                f"task {self._task_label(selected_task)} left new uncommitted changes "
-                f"in the working tree: {paths}"
-            )
+            self._log_allowed_dirty("task", new_dirty, selected_task)
 
     def _accept_task_result_or_raise(
         self,
@@ -883,24 +987,47 @@ class Runner:
         selected_task: Task,
         plan_before: str,
         context_before: dict[Path, bytes],
+        head_before: str,
+        dirty_before: set[Path],
     ) -> bool:
-        plan = self._parse_plan_file()
-        current_task = self._matching_task(plan, selected_task)
-        if current_task is None or current_task.complete:
-            return False
-        if not self._later_tasks_unchanged(selected_task, plan_before, plan):
+        status = self._task_completion_status(
+            selected_task, plan_before, context_before, head_before, dirty_before,
+        )
+        if not status.repairable and self._active_cwd is None:
             self.log.diagnostic(
                 "session=task event=completion_retry_rejected "
-                f"task={self._task_label(selected_task)!r} reason=later_tasks_modified"
+                f"task={self._task_label(selected_task)!r} reason={'; '.join(status.errors)!r}"
             )
-            return False
-        if self._changed_plan_context(context_before):
-            self.log.diagnostic(
-                "session=task event=completion_retry_rejected "
-                f"task={self._task_label(selected_task)!r} reason=read_only_context_modified"
-            )
-            return False
-        return True
+        return not status.complete and (status.repairable or self._active_cwd is not None)
+
+    def _can_restore_contract_for_retry(
+        self, selected_task: Task, plan_before: str, context_before: dict[Path, bytes],
+        head_before: str, dirty_before: set[Path], retries_left: int,
+    ) -> bool:
+        return (
+            retries_left > 0 and self._active_cwd is not None
+            and not self._task_completion_status(
+                selected_task, plan_before, context_before, head_before, dirty_before,
+            ).repairable
+        )
+
+    def _restore_task_contract(self, plan_before: str, context_before: dict[Path, bytes]) -> None:
+        assert self._active_cwd is not None and self.options.plan_file is not None
+        changes = {self.options.plan_file: plan_before.encode("utf-8")}
+        for path in self._changed_plan_context(context_before):
+            changes[path] = context_before.get(path)
+        for path in changes:
+            if path.is_symlink() or not path.resolve().is_relative_to(self._active_cwd.resolve()):
+                raise GitError(f"cannot restore protected content through a symlink or external path: {path}")
+            if path.exists() and not path.is_file():
+                raise GitError(f"protected content was replaced with a directory: {path}")
+        for path, content in changes.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+        self.log.diagnostic("session=task event=contract_restored action=revalidate_original_requirements")
 
     def _prepare_task_retry(
         self,
@@ -931,6 +1058,16 @@ class Runner:
             )
             return False
 
+        if self._git().head_commit() != head_before:
+            status = self._task_completion_status(
+                selected_task, plan_before, context_before, head_before, dirty_before,
+            )
+            if not status.repairable:
+                self.log.diagnostic(
+                    "session=task event=retry_guard_rejected "
+                    f"task={self._task_label(selected_task)!r} reason=protected_plan_modified"
+                )
+                return False
         self._restore_plan_snapshot_if_safe(
             plan_before,
             selected_task,
@@ -986,25 +1123,9 @@ class Runner:
         head_before: str,
         dirty_before: set[Path],
     ) -> bool:
-        assert self.options.plan_file is not None
-        plan = self._parse_plan_file()
-        completed_task = self._matching_task(plan, selected_task)
-        task_complete = completed_task is not None and completed_task.complete
-        later_tasks_unchanged = self._later_tasks_unchanged(
-            selected_task,
-            plan_before,
-            plan,
-        )
-        return (
-            task_complete
-            and later_tasks_unchanged
-            and not self._changed_plan_context(context_before)
-            and self._git().head_commit() != head_before
-            and (
-                self.options.allow_dirty
-                or not (self._uncommitted_paths() - dirty_before)
-            )
-        )
+        return self._task_completion_status(
+            selected_task, plan_before, context_before, head_before, dirty_before,
+        ).complete
 
     def _log_allowed_dirty(
         self,
@@ -1046,6 +1167,13 @@ class Runner:
         if not state:
             state.append("the selected task checklist changed without a clean committed completion")
 
+        if self._active_cwd is not None:
+            return (
+                f"{describe_failure('gigacode task session', result)}; automatic retries "
+                f"were exhausted while task {self._task_label(selected_task)} still lacked "
+                f"a clean committed completion ({'; '.join(state)}). "
+                "The isolated task result will be preserved before cleanup."
+            )
         continuation = (
             "If the partial work is valid, inspect it and rerun the same plan"
             + (" with --allow-dirty" if new_dirty else "")
@@ -1089,48 +1217,6 @@ class Runner:
             if path.read_bytes() != before[path]
         )
         return sorted(changed)
-
-    def _validate_later_tasks_unchanged(
-        self,
-        selected_task: Task,
-        plan_before: str,
-        plan_after: Plan,
-    ) -> None:
-        if not self._later_tasks_unchanged(selected_task, plan_before, plan_after):
-            raise RuntimeError(
-                f"task {self._task_label(selected_task)} modified or marked a later plan section"
-            )
-
-    def _later_tasks_unchanged(
-        self,
-        selected_task: Task,
-        plan_before: str,
-        plan_after: Plan,
-    ) -> bool:
-        before = parse_plan(plan_before, plan_format=self.options.plan_kind)
-        selected_matches = [
-            index
-            for index, task in enumerate(before.tasks)
-            if task.number == selected_task.number and task.title == selected_task.title
-        ]
-        if len(selected_matches) != 1:
-            return False
-
-        for later_task in before.tasks[selected_matches[0] + 1:]:
-            after_task = self._matching_task(plan_after, later_task)
-            if after_task is None:
-                return False
-            before_checkboxes = [
-                (checkbox.text, checkbox.checked)
-                for checkbox in later_task.checkboxes
-            ]
-            after_checkboxes = [
-                (checkbox.text, checkbox.checked)
-                for checkbox in after_task.checkboxes
-            ]
-            if after_checkboxes != before_checkboxes:
-                return False
-        return True
 
     @staticmethod
     def _task_label(task: Task) -> str:
@@ -1382,6 +1468,7 @@ class Runner:
                 if (remapped := remap(path)) is not None
             ),
             review_manifest=review_manifest,
+            resume_note=context.resume_note,
         )
 
     def _uncommitted_paths(self) -> set[Path]:

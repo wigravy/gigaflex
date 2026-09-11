@@ -35,6 +35,8 @@ class Task:
     title: str
     checkboxes: list[Checkbox] = field(default_factory=list)
     section: str = ""
+    start_line: int = field(default=0, compare=False, repr=False)
+    end_line: int = field(default=0, compare=False, repr=False)
 
     @property
     def complete(self) -> bool:
@@ -123,11 +125,12 @@ def parse_plan(content: str, *, plan_format: str = "gigaflex") -> Plan:
     current_lines: list[str] = []
     fence = FenceTracker()
 
-    def finish_current_task() -> None:
+    def finish_current_task(end_line: int) -> None:
         nonlocal current, current_lines
         if current is None:
             return
         current.section = "\n".join(current_lines).rstrip()
+        current.end_line = end_line
         if plan_format == "openspec" and not current.checkboxes:
             current.checkboxes.append(
                 Checkbox(
@@ -138,7 +141,8 @@ def parse_plan(content: str, *, plan_format: str = "gigaflex") -> Plan:
             )
         plan.tasks.append(current)
 
-    for line in content.splitlines():
+    lines = content.splitlines()
+    for line_number, line in enumerate(lines, start=1):
         if fence.skip(line):
             if current is not None:
                 current_lines.append(line)
@@ -157,15 +161,19 @@ def parse_plan(content: str, *, plan_format: str = "gigaflex") -> Plan:
         )
         if task_match:
             if current is not None:
-                finish_current_task()
-            current = Task(number=parse_task_number(task_match.group(1)), title=task_match.group(2).strip())
+                finish_current_task(line_number - 1)
+            current = Task(
+                number=parse_task_number(task_match.group(1)),
+                title=task_match.group(2).strip(),
+                start_line=line_number,
+            )
             current_lines = [line]
             continue
 
         is_h2 = line.startswith("##") and not line.startswith("###")
         is_h1_after_title = line.startswith("#") and plan.title and not line.startswith("##")
         if current is not None and (is_h2 or is_h1_after_title):
-            finish_current_task()
+            finish_current_task(line_number - 1)
             current = None
             current_lines = []
             continue
@@ -182,8 +190,52 @@ def parse_plan(content: str, *, plan_format: str = "gigaflex") -> Plan:
                 )
 
     if current is not None:
-        finish_current_task()
+        finish_current_task(len(lines))
     return plan
+
+
+def task_plan_update_allowed(
+    before: str,
+    after: str,
+    selected_task: Task,
+    *,
+    plan_format: str = "gigaflex",
+) -> bool:
+    """Allow only forward checkbox updates or the selected prose-task marker.
+
+    All requirements, examples, headings, and other tasks remain unchanged.
+    Line-ending style and a final newline do not affect this comparison.
+    """
+    matches = parse_plan(before, plan_format=plan_format).tasks_matching(
+        selected_task.number, selected_task.title,
+    )
+    if len(matches) != 1:
+        return False
+    task = matches[0]
+    original = before.splitlines()
+    updated = after.splitlines()
+    if task.has_implicit_tracking:
+        marked = original.copy()
+        marked.insert(task.start_line, f"- [x] {task.number}. {task.title}")
+        return updated == original or updated == marked
+    if len(original) != len(updated):
+        return False
+    fence = FenceTracker()
+    for index, (old_line, new_line) in enumerate(zip(original, updated)):
+        in_selected = task.start_line - 1 <= index < task.end_line
+        in_fence = fence.skip(old_line) if in_selected else False
+        if old_line == new_line:
+            continue
+        checkbox = CHECKBOX_RE.match(old_line) if in_selected and not in_fence else None
+        if checkbox is None or not Checkbox(checkbox.group(2), False).actionable:
+            return False
+        position = checkbox.start(1)
+        if not any(
+            new_line == old_line[:position] + state + old_line[position + 1:]
+            for state in ("x", "X")
+        ):
+            return False
+    return True
 
 
 def parse_plan_file(path: Path, *, plan_format: str = "gigaflex") -> Plan:

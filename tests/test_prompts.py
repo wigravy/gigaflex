@@ -13,6 +13,8 @@ from gigaflex.prompts import (
     PromptContext,
     load_prompt_templates,
     render_make_plan,
+    render,
+    render_review_agent_prompt,
     render_plan_skill,
     render_review_format_retry_prompt,
     render_review_prompt,
@@ -37,6 +39,19 @@ suggested_fix: Verify HEAD after each task.
 
 
 class PromptTemplatesTest(unittest.TestCase):
+    def test_resume_note_reaches_task_review_synthesis_and_finalize_without_formatting_it(self) -> None:
+        context = PromptContext(Path('plan.md'), Path('progress.txt'), 'main',
+                                resume_note='The service is back {now}')
+        prompts = (
+            render_task_prompt(DEFAULT_PROMPTS.task, context, 1, 'Build', '- [ ] Build'),
+            render_review_prompt(DEFAULT_PROMPTS.review, context),
+            render_review_agent_prompt(DEFAULT_PROMPTS.review_agent, 'quality', 'quality', context),
+            render_review_synthesis_prompt(DEFAULT_PROMPTS.review_synthesis, {'quality': 'NO FINDINGS'}, context),
+            render(DEFAULT_PROMPTS.finalize, context),
+        )
+        for prompt in prompts:
+            self.assertEqual(1, prompt.count('The service is back {now}'))
+
     def test_make_plan_prompt_preserves_request_language(self) -> None:
         self.assertIn("Write the entire plan in the same language as the user's request.", DEFAULT_PROMPTS.make_plan)
 
@@ -169,7 +184,7 @@ class PromptTemplatesTest(unittest.TestCase):
             True,
         )
 
-        self.assertIn("previous task agent process exited successfully", prompt)
+        self.assertIn("runner validation found that the selected task has not satisfied its completion requirements", prompt)
         self.assertIn("corrective retry for the same selected task", prompt)
         self.assertIn(
             "<COMPLETION_MARKER>\n"
@@ -192,7 +207,7 @@ class PromptTemplatesTest(unittest.TestCase):
         self.assertIn("identity: 3: Проверка", prompt)
         self.assertIn("### Задача 3: Проверка\n- [ ] Запустить тесты", prompt)
         self.assertIn("`plan.md` is the runner-owned task checklist", prompt)
-        self.assertIn("do not change checkbox text, task headings, or any later task section", prompt)
+        self.assertIn("preserve checkbox text, task headings, requirements, examples, and validation instructions", prompt)
 
     def test_make_plan_prompt_forbids_overlapping_testing_tasks(self) -> None:
         self.assertIn("Make task scopes mutually exclusive", DEFAULT_PROMPTS.make_plan)

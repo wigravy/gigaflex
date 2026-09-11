@@ -1443,7 +1443,7 @@ class RunnerTest(unittest.TestCase):
                 ProgressLog(repo / "progress.txt"),
             )
 
-            with self.assertRaisesRegex(RuntimeError, "marked a later plan section"):
+            with self.assertRaisesRegex(RuntimeError, "modified protected plan content"):
                 runner.run_tasks()
 
             self.assertEqual(1, len(prompts))
@@ -1527,10 +1527,10 @@ class RunnerTest(unittest.TestCase):
                 ProgressLog(repo / "progress.txt"),
             )
 
-            with self.assertRaisesRegex(RuntimeError, "marked a later plan section"):
+            with self.assertRaisesRegex(RuntimeError, "modified protected plan content"):
                 runner.run_tasks()
 
-    def test_task_completion_is_identified_by_number_and_title(self) -> None:
+    def test_task_completion_rejects_reordering_other_sections(self) -> None:
         with temporary_repo() as (repo, plan):
             plan.write_text(
                 """# Plan: Demo
@@ -1573,7 +1573,8 @@ class RunnerTest(unittest.TestCase):
                 ProgressLog(repo / "progress.txt"),
             )
 
-            runner.run_tasks()
+            with self.assertRaisesRegex(RuntimeError, "modified protected plan content"):
+                runner.run_tasks()
 
     def test_task_iteration_requires_a_commit(self) -> None:
         with temporary_repo() as (repo, plan):
@@ -1610,6 +1611,7 @@ class RunnerTest(unittest.TestCase):
                     progress_file=repo / "progress.txt",
                     tasks_only=True,
                     finalize_enabled=False,
+                    task_completion_retries=0,
                 ),
                 CallbackExecutor(complete_and_leave_dirty),  # type: ignore[arg-type]
                 ProgressLog(repo / "progress.txt"),

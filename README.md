@@ -90,12 +90,54 @@ refreshes `context-my-feature.txt` with at most the last 200 lines/50,000
 characters written by the current process and labels it as a static prompt-time
 snapshot. Earlier runs therefore cannot silently grow task and review context.
 
-Successful phases are recorded in `checkpoint-my-feature.json`. After an
-interruption, a normal plan run reuses a completed review and resumes at
+Successful phases are recorded in `checkpoint-my-feature.json`. A resumed
+plan run reuses a completed review and resumes at
 finalize—or reuses finalize too—only when the plan identity, immutable base,
 current `HEAD`, and a snapshot of the working tree still match exactly. Any
 repository change invalidates the affected checkpoint. An explicit `--review`
 request always performs a fresh review.
+
+An unpromoted task result is saved before cleanup, including after an exception,
+a promotion conflict, or Ctrl+C. Its recovery directory is printed in the error
+and recorded in the progress log. For a normal checkout it is
+`.git/gigaflex/recovery/<id>/`; linked worktrees share the repository's common
+Git directory. Each directory contains a verified `task.bundle`, a manifest,
+and `README.txt` with commands to reconstruct the failed task in a new worktree.
+The bundle preserves task commits, the index, tracked working-tree changes,
+and non-ignored untracked files; ignored untracked files and external files are
+excluded. It requires the original repository base commit. Recovery does not
+apply changes to the execution branch. Bundles remain until manually removed.
+If recovery cannot be saved, the task worktree is retained and its path is
+reported instead of deleting the only copy. This also applies to populated
+submodules and nested repositories, whose contents a parent bundle cannot save.
+
+When automatic attempts are exhausted, the terminal and dashboard show
+**Needs attention**, the cause, the saved-work location, and a ready-to-run
+continuation command. Statistics and dashboard JSON use `status: blocked`;
+the process exits with code 1. Ctrl+C records `interrupted` and exits with 130.
+There are no external notifications and no process waiting for an interactive
+answer. Resolve the reported cause, then use the printed command. For example:
+
+```bash
+gigaflex docs/plans/my-feature.md --resume
+gigaflex --openspec openspec/changes/my-feature --resume --resume-note "Test service restarted"
+```
+
+The printed command preserves the original options and pins the captured base
+commit; it adds `--allow-dirty` if the task had dirty inputs. `--resume` loads the
+saved commits, index, and working files into an isolated task worktree, or uses
+the retained worktree if bundle creation failed. It then finishes the pending
+task and continues the run. A clean, already completed task whose promotion
+failed can be promoted without another agent call. `--resume-note` supplies
+operator context to the task, review, and finalize prompts.
+
+Resume requires the original execution branch, HEAD, file contents, and staged
+state. A changed checkout or a concurrent resume stops safely and retains the
+saved work. If you intentionally changed the checkout and want to proceed from
+that state, use `--restart` instead of `--resume`; it releases the stopped-run
+record while retaining old recovery bundles and any retained worktree for manual
+inspection. A normal launch never silently discards a recorded stopped task.
+Existing bundles from the earlier format remain available for manual recovery.
 
 Run a standard local OpenSpec `spec-driven` change by passing its change
 directory:
@@ -448,19 +490,27 @@ Review behavior:
 - kill silent sessions with `--idle-timeout SECONDS`; any stdout bytes reset
   the timer even when the process has not emitted a complete line
 - retry failed sessions with `--retry-count N --retry-delay SECONDS`
-- when a successful task session leaves its selected checkbox or prose-task
-  marker pending, automatically recheck the unchanged task boundary and retry
-  it up to `retry_count` times with an explicit corrective prompt; unsafe
-  changes to later tasks or read-only OpenSpec context are never retried
+- when a successful task session leaves its selected section pending, creates
+  no commit, or leaves new uncommitted files, retry the same task workspace up
+  to `retry_count` times with the specific unmet completion requirements
+- only forward checkbox updates in the selected section, or its exact prose
+  completion marker, are permitted; requirements, headings, examples, validation
+  instructions, and all other sections must remain unchanged
+- modified requirements or read-only OpenSpec context prevent task acceptance;
+  a corrective attempt restores the original plan/context in the isolated
+  workspace, preserves implementation work, and requires revalidation of every
+  original selected requirement and a committed correction
 - before retrying a failed task process, GigaFlex restores the plan snapshot
   only while the isolated task HEAD is unchanged; it never rewrites a checklist
-  behind an already-created commit
+  behind an already-created commit during transport retries; restoring a
+  committed contract violation is a separate corrective attempt
 - if a task session times out after a clean task commit, the completed
   iteration is accepted without rerunning the task agent
 - a contradictory `TASK_FAILED` marker is treated as a protocol warning when
   repository validation proves a clean committed completion
-- only exhausted task retries stop for operator inspection; the plan is restored
-  to the current task before the run exits
+- contract corrections share the bounded task-completion retry budget;
+  exhaustion or an unsafe restoration stops with a continuation command, after
+  saving the unpromoted task result
 - if a configured model returns `API Error: 404 Model not found`, retry the same
   prompt without `--model` and use GigaCode's default model for later calls
 - classify transient failures with `retry_patterns`
@@ -548,9 +598,11 @@ Git behavior:
 - pre-existing dirty paths left untouched by a task retain their staged,
   unstaged, or untracked state; promotion stops if the main working tree changes
   concurrently after the task snapshot is created
-- newly uncommitted paths left by a completed task or finalize pass are logged
-  and carried into the next phase instead of stopping execution; task checklist
-  completion and a task commit are still required
+- every isolated task must finish with no uncommitted changes, even when
+  `--allow-dirty` permitted user changes in the main checkout; leftover task
+  files receive a corrective retry before the result can be promoted
+- `--allow-dirty` still permits new uncommitted paths left by finalize; this
+  override does not relax isolated task completion requirements
 - with `--allow-dirty`, review prompts include committed, staged, unstaged, and
   untracked changes via `git status --short`, `git diff --cached`, and `git diff`
 - completed full runs move the plan file to `completed/`

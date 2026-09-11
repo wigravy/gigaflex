@@ -166,8 +166,10 @@ A successful task session must leave:
 
 - the selected checkbox section or prose marker complete
 - a task commit after the iteration baseline
-- a clean working tree, unless `--allow-dirty` is active
+- a clean isolated working tree, including when the main checkout uses `--allow-dirty`
 - read-only OpenSpec context unchanged
+- original plan content preserved except forward checkbox updates in the selected
+  section or its exact prose completion marker
 
 Regular markdown plans are moved to `completed/` after a successful full run by
 default. OpenSpec `tasks.md` is never moved.
@@ -378,7 +380,7 @@ review safety bindings added by the renderer.
 - `--session-timeout SECONDS` limits total duration of one GigaCode session.
 - `--idle-timeout SECONDS` kills a session after a silent interval.
 - `--retry-count N` and `--retry-delay SECONDS` configure executor and
-  incomplete-task retries.
+  task-completion retries for pending tracking, missing commits, and leftover files.
 - `--retry-pattern TEXT` adds transient error patterns.
 - `--rate-limit-pattern TEXT` adds rate-limit patterns.
 - `--wait-on-rate-limit SECONDS` waits before retrying a detected rate limit.
@@ -387,8 +389,34 @@ review safety bindings added by the renderer.
 - A configured model returning `API Error: 404 Model not found` is retried once
   without the model override; later calls use GigaCode's default model.
 - A timed-out task is accepted when it already left a valid clean task commit.
-- Failed partial task work may remain for the retry, but the task checklist is
-  restored to its iteration-start snapshot.
+- A failed task process can restore its checklist snapshot only before it
+  creates a commit. A separate corrective attempt can restore the original
+  plan and read-only context after a committed violation, preserving code and
+  requiring revalidation of all original selected requirements. It shares the
+  bounded task-completion retry budget.
+- Unpromoted task commits, the index, tracked files, and non-ignored untracked
+  files are saved to a verified recovery bundle before temporary worktree cleanup.
+  The error and log report its directory in the common Git directory under
+  `gigaflex/recovery/<id>/`. Its README reconstructs the result in a NEW worktree;
+  it does not apply it to the execution branch. The original base commit is required.
+- Recovery bundles remain until manually removed. Ignored untracked files and
+  external files are excluded. If saving fails, the original task worktree is
+  retained and its path is reported. Ctrl+C also preserves the partial result.
+- Populated submodules and nested repositories require retaining the worktree:
+  a parent repository bundle cannot preserve their contents.
+- Exhausted runs report `blocked` in statistics and dashboard JSON, exit 1,
+  and print the cause, saved-work location, and a continuation command in the
+  terminal and dashboard. Ctrl+C reports `interrupted` and exits 130. There are
+  no external notifications or interactive prompts waiting for input.
+- Use the printed command with `--resume` to continue the saved task, including
+  its commits and staged/unstaged work. The command pins the original review
+  base and preserves startup options, including dirty-input permission.
+  `--resume-note "context"` supplies operator context to all execution phases.
+- Resume requires unchanged execution branch, HEAD, working contents, and index.
+  Concurrent resumes are rejected. Changed state keeps the recovery packet;
+  `--restart` explicitly starts from the current checkout while retaining old
+  bundles and worktrees for manual inspection. Ordinary runs cannot silently
+  discard a recorded stopped task. Earlier bundle formats use manual recovery.
 
 ## Diagnostics and Development
 

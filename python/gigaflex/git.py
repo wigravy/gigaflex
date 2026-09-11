@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
@@ -392,6 +392,8 @@ class GitService:
         self,
         index_path: Path,
         excluded_paths: Iterable[Path] = (),
+        *,
+        index_ref: Optional[str] = None,
     ) -> str:
         """Create an unreachable commit for the current working-tree state."""
         head = self.head_commit()
@@ -408,7 +410,7 @@ class GitService:
             "GIT_COMMITTER_EMAIL": "gigaflex@localhost",
         }
         try:
-            self.run("read-tree", head, env=snapshot_env)
+            self.run("read-tree", index_ref or head, env=snapshot_env)
             self.run("add", "--all", env=snapshot_env)
             excluded = [str(_normalize_relative(path)) for path in excluded_paths]
             if excluded:
@@ -762,7 +764,7 @@ class _ReviewWorktreeContext:
         return review_context
 
 
-@dataclass(frozen=True)
+@dataclass
 class TaskWorktree:
     manager: "TaskWorktreeManager"
     path: Path
@@ -770,6 +772,11 @@ class TaskWorktree:
     base_commit: str
     snapshot_commit: str
     original_dirty_paths: frozenset[Path]
+    original_index_tree: str = ""
+    original_branch: str = ""
+    resumed: bool = False
+    promoted: bool = field(default=False, init=False)
+    recovery_path: Optional[Path] = field(default=None, init=False)
 
     def promote(self, task_head: str) -> list[str]:
         return self.manager.promote(self, task_head)
@@ -790,6 +797,9 @@ class TaskWorktreeManager:
 
     def create(self, label: str) -> "_TaskWorktreeContext":
         return _TaskWorktreeContext(self, label)
+
+    def resume(self, label: str, recovery: dict[str, object]) -> "_TaskWorktreeContext":
+        return _TaskWorktreeContext(self, label, recovery)
 
     def promote(self, workspace: TaskWorktree, task_head: str) -> list[str]:
         task_git = GitService(workspace.path)
@@ -822,6 +832,7 @@ class TaskWorktreeManager:
                 promoted_head,
                 touched_paths,
             )
+            workspace.promoted = True
         finally:
             self.git.remove_worktree(promotion_path)
             self.git.prune_worktrees()
@@ -975,16 +986,34 @@ class TaskWorktreeManager:
 
 
 class _TaskWorktreeContext:
-    def __init__(self, manager: TaskWorktreeManager, label: str) -> None:
+    def __init__(
+        self, manager: TaskWorktreeManager, label: str,
+        recovery: Optional[dict[str, object]] = None,
+    ) -> None:
         self.manager = manager
         self.label = label
         self.root: Optional[Path] = None
         self.path: Optional[Path] = None
+        self.workspace: Optional[TaskWorktree] = None
+        self.recovery = recovery
+        self._resume_lock = None
 
     def __enter__(self) -> TaskWorktree:
         parent = str(self.manager.temp_parent) if self.manager.temp_parent else None
         self.root = Path(tempfile.mkdtemp(prefix="gigaflex-task-", dir=parent))
         try:
+            if self.recovery is not None:
+                from .task_recovery import lock_task_recovery, restore_task_recovery
+
+                self._resume_lock = lock_task_recovery(self.manager, self.recovery)
+                workspace = restore_task_recovery(self.manager, self.label, self.recovery, self.root)
+                if workspace.path.parent != self.root:
+                    self.root.rmdir()
+                    self.root = workspace.path.parent
+                self.workspace = workspace
+                self.path = workspace.path
+                self.manager.report(f"session=task-worktree event=resumed path={str(self.path)!r}")
+                return workspace
             base_commit = self.manager.git.head_commit()
             if not base_commit:
                 raise GitError("cannot create a task worktree without a HEAD commit")
@@ -1009,19 +1038,60 @@ class _TaskWorktreeContext:
                 f"path={str(path)!r} base={base_commit} snapshot={snapshot} "
                 f"dirty_paths={len(original_dirty_paths)}"
             )
-            return TaskWorktree(
+            self.workspace = TaskWorktree(
                 manager=self.manager,
                 path=path,
                 repo_root=self.manager.repo_root,
                 base_commit=base_commit,
                 snapshot_commit=snapshot,
                 original_dirty_paths=original_dirty_paths,
+                original_index_tree=self.manager.git.run("write-tree").stdout.strip(),
+                original_branch=self.manager.git.current_branch(),
             )
+            return self.workspace
         except BaseException:
-            self._cleanup()
+            try:
+                self._cleanup()
+            finally:
+                if self._resume_lock is not None:
+                    self._resume_lock.close()
             raise
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            self._finish(exc)
+        finally:
+            if self._resume_lock is not None:
+                self._resume_lock.close()
+
+    def _finish(self, exc) -> None:
+        recovery_notice = ""
+        if self.workspace is not None and not self.workspace.promoted:
+            from .task_recovery import save_task_recovery, task_interruption
+
+            try:
+                recovery = save_task_recovery(
+                    self.workspace, self.label, str(exc) if exc is not None else "task not promoted",
+                )
+            except (Exception, KeyboardInterrupt) as recovery_error:
+                # Never dispose of the sole copy when durable recovery failed.
+                message = (
+                    f"{exc or 'task not promoted'}; task recovery failed: {str(recovery_error) or 'recovery interrupted'}; "
+                    f"task worktree retained at: {self.path}"
+                )
+                self.manager.report(
+                    "session=task-worktree event=recovery_failed "
+                    f"path={str(self.path)!r} error={str(recovery_error)!r}"
+                )
+                raise task_interruption(
+                    recovery_error if isinstance(recovery_error, KeyboardInterrupt) else exc,
+                    message, self.workspace, self.label, retained=True,
+                ) from recovery_error
+            self.workspace.recovery_path = recovery
+            recovery_notice = f"task recovery saved to: {recovery} (see README.txt)"
+            self.manager.report(
+                f"session=task-worktree event=recovery_saved path={str(recovery)!r}"
+            )
         try:
             self._cleanup()
         except Exception as cleanup_error:
@@ -1031,6 +1101,12 @@ class _TaskWorktreeContext:
                 "session=task-worktree event=cleanup_failed "
                 f"error={str(cleanup_error)!r}"
             )
+        if exc is not None and recovery_notice:
+            if isinstance(exc, (Exception, KeyboardInterrupt)):
+                raise task_interruption(
+                    exc, f"{str(exc) or 'task interrupted'}; {recovery_notice}",
+                    self.workspace, self.label,
+                ) from exc
 
     def _cleanup(self) -> None:
         root = self.root
@@ -1046,7 +1122,10 @@ class _TaskWorktreeContext:
                 )
             except (OSError, GitError) as exc:
                 cleanup_errors.append(f"{self.path}: {exc}")
-        self.manager.git.prune_worktrees()
+        try:
+            self.manager.git.prune_worktrees()
+        except (OSError, GitError) as exc:
+            cleanup_errors.append(f"git worktree prune: {exc}")
         try:
             if root.exists():
                 shutil.rmtree(root)
