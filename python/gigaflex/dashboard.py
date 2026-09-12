@@ -368,6 +368,17 @@ class ProgressDashboard:
             self._mark_current_review_failed_locked("interrupted" if interrupted else "blocked", reason)
             self._write_locked()
 
+    def validation_finished(self, report: dict[str, object]) -> None:
+        with self._lock:
+            self._state["validation"] = report
+            self._state.setdefault("validations", {})[report["phase"]] = report
+            self._write_locked()
+
+    def result_verified(self, report: dict[str, object]) -> None:
+        with self._lock:
+            self._state["verification"] = report
+            self._write_locked()
+
     @property
     def state(self) -> dict[str, object]:
         with self._lock:
@@ -521,6 +532,7 @@ def _render_html(state: dict[str, object]) -> str:
         if isinstance(item, dict)
     ) or '<p class="empty">Waiting for GigaCode…</p>'
     review_html = _review_html(review) if isinstance(review, dict) else ""
+    validation_html = _validation_html(state)
     known_calls = usage.get("known_calls", 0) if isinstance(usage, dict) else 0
     token_text = (
         f"{int(usage.get('total_tokens', 0)):,}" if isinstance(usage, dict) and known_calls else "—"
@@ -616,6 +628,7 @@ def _render_html(state: dict[str, object]) -> str:
       <aside class="panel"><h2>Active sessions</h2>{session_html}<div class="metrics"><div class="metric"><b>{token_text}</b><span>tokens</span></div><div class="metric"><b>{sum(1 for item in tasks if isinstance(item, dict) and item.get('status') == 'completed')} / {len(tasks)}</b><span>tasks complete</span></div></div></aside>
     </div>
     {review_html}
+    {validation_html}
     <footer>{f'<span>Branch: <code>{branch}</code></span>' if branch else ''}<span>Updated: <time>{updated_at}</time></span>{f'<span>Detailed log: <code>{progress_file}</code></span>' if progress_file else ''}</footer>
   </main>
   <script>
@@ -632,6 +645,27 @@ def _render_html(state: dict[str, object]) -> str:
 </body>
 </html>
 """
+
+
+def _validation_html(state: dict[str, object]) -> str:
+    reports = state.get("validations", {})
+    if not reports:
+        return ""
+    rows = []
+    for phase, report in reports.items():
+        label = html.escape(str(phase))
+        if report.get("status") == "not_configured":
+            rows.append(f'<p><b>{label}:</b> No runner checks configured. Evidence: agent reports and repository integrity checks.</p>')
+        else:
+            for check in report.get("checks", []):
+                rows.append('<p><b>' + label + ' / ' + html.escape(str(check.get("name", "")))
+                            + ':</b> ' + html.escape(str(check.get("status", "")))
+                            + ' · exit ' + html.escape(str(check.get("returncode"))) + '</p>')
+    verified = state.get("verification", {}).get("repository")
+    if verified:
+        rows.append('<p>Verified result: HEAD <code>' + html.escape(str(verified["head"]))
+                    + '</code><br>Tree <code>' + html.escape(str(verified["tree"])) + '</code></p>')
+    return '<section class="panel"><h2>Runner checks</h2>' + ''.join(rows) + '</section>'
 
 
 def _phase_html(item: dict[str, object]) -> str:

@@ -69,6 +69,13 @@ reason: {reason}
 
 
 class RunnerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Protocol-only tests must not inspect or snapshot the developer checkout.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(temporary.name)
+
     def test_parallel_review_skips_synthesis_when_all_agents_are_clean(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -502,11 +509,6 @@ class RunnerTest(unittest.TestCase):
                     "do not recreate the repository-wide diff" in prompt
                     for prompt in prompts.values()
                 )
-                for path in workdirs.values():
-                    (path / "reviewer-write.txt").write_text(
-                        "isolated\n",
-                        encoding="utf-8",
-                    )
                 return {
                     name: ExecResult(output="NO FINDINGS\n", returncode=0)
                     for name in prompts
@@ -560,10 +562,6 @@ class RunnerTest(unittest.TestCase):
                 assert cwd is not None
                 self.single_prompts.append(prompt)
                 self.cwd = cwd
-                (cwd / "reviewer-write.txt").write_text(
-                    "isolated\n",
-                    encoding="utf-8",
-                )
                 return ExecResult(output="NO FINDINGS\n", returncode=0)
 
         with temporary_repo() as (repo, plan):
@@ -2241,7 +2239,7 @@ class RunnerTest(unittest.TestCase):
 
             runner.run_finalize()
 
-    def test_allow_dirty_accepts_new_finalize_changes(self) -> None:
+    def test_allow_dirty_does_not_accept_finalize_mutations(self) -> None:
         with temporary_repo() as (repo, plan):
             def finalize_and_leave_dirty(_prompt):
                 (repo / "finalize-leftover.txt").write_text("dirty\n", encoding="utf-8")
@@ -2262,12 +2260,8 @@ class RunnerTest(unittest.TestCase):
                 ProgressLog(progress),
             )
 
-            runner.run_finalize()
-
-            self.assertIn(
-                "session=finalize event=new_uncommitted_changes_allowed",
-                progress.read_text(encoding="utf-8"),
-            )
+            with self.assertRaisesRegex(RuntimeError, 'finalize changed HEAD, file contents, or staged state'):
+                runner.run_finalize()
 
 
 class FailureDescriptionTest(unittest.TestCase):

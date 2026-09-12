@@ -172,7 +172,9 @@ A successful task session must leave:
   section or its exact prose completion marker
 
 Regular markdown plans are moved to `completed/` after a successful full run by
-default. OpenSpec `tasks.md` is never moved.
+default. The move is a separate isolated commit, preserves the plan bytes, and
+is rejected if it changes any other path or if the repository changed after
+verification. OpenSpec `tasks.md` is never moved.
 
 ## Plan Creation and Bundled Skills
 
@@ -220,8 +222,9 @@ identifiers such as `F001`.
 If every reviewer reports no findings, synthesis is skipped. Otherwise the
 synthesis session validates each finding and returns exactly one `fixed`,
 `rejected`, `confirmed`, or `blocked` decision per identifier. Synthesis uses
-the task model and is the only review stage allowed to fix files, run tests, and
-commit corrections. Fixed or confirmed findings trigger another specialist
+the task model in one recoverable isolated candidate. Dirty output receives a
+bounded retry there; only clean commits are promoted. Fixed, confirmed, or
+otherwise code-changing decisions trigger another specialist
 verification. Follow-up verification always includes `quality` and
 `implementation`, plus specialists represented in the latest fixed/confirmed
 ledger. It inspects only the immediately preceding synthesis delta and ledger
@@ -232,9 +235,19 @@ A reported blocker is audited once before it can stop the run. Review allows 10
 repair cycles by default and always adds one terminal read-only verification
 after the final allowed repair.
 
-Finalize runs after successful review by default. Disable it with
-`--no-finalize` or `finalize_enabled = false`. Use `--no-parallel-review` for a
-single read-only reviewer followed by the same synthesis protocol.
+Finalize runs read-only after successful review by default. If it discovers a
+repair, the repair is committed in an isolated candidate, followed by fresh
+review and another finalize pass. Disable it with `--no-finalize` or
+`finalize_enabled = false`. Use `--no-parallel-review` for a single read-only
+reviewer followed by the same synthesis protocol.
+
+`validation_commands` optionally configures runner-owned checks as a JSON list
+with `name`, an explicit `argv` array, relative `cwd`, positive `timeout`, and
+`phases` selected from `task`, `review`, and `finalize`. Commands run directly
+without a shell. Their exit status and repository binding are shown separately
+from agent reports in the terminal log and dashboard. With no configured
+checks, the dashboard identifies agent reports and repository integrity checks
+as the available evidence.
 
 ## Git Behavior
 
@@ -317,6 +330,7 @@ default_branch =
 max_iterations = 50
 review_iterations = 10
 finalize_enabled = true
+# validation_commands = [{"name":"tests","argv":["python3","-m","unittest","discover","-s","tests"],"cwd":".","timeout":300,"phases":["review","finalize"]}]
 session_timeout = 1800
 idle_timeout = 900
 retry_count = 1

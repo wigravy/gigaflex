@@ -464,17 +464,19 @@ REVIEW_SYNTHESIS_ORCHESTRATION_GUIDANCE = """Runner-owned orchestration boundary
 FINALIZE_PROMPT = """Phase: final verification for {goal}.
 
 Inspect git status and the final diff. Run the validation commands from the plan when available. Run relevant automated tests whenever executable behavior changed, and use appropriate artifact checks for non-executable deliverables.
-Do not add features, perform unrelated refactoring, or rewrite history.
+This is read-only verification of a fixed, already reviewed result. Do not edit
+files, stage changes, create commits, add features, or rewrite history. Report
+required repairs so the runner can route them through repair and fresh review.
 
 Success requires:
 - all required validation commands pass
 - no known implementation, testing, artifact-validation, or review issue remains
-- finalization creates no uncommitted changes and preserves any pre-existing user changes untouched
+- HEAD, staged state, tracked files, plan/context, and non-ignored untracked files remain unchanged
 
 If final verification succeeds, briefly summarize the checks and output exactly this as the final non-empty line:
 <<<GIGAFLEX:FINALIZE_DONE>>>
 
-If validation fails or the branch cannot be left clean after reasonable fixes, explain the blocker and output exactly this as the final non-empty line:
+If validation fails or a repair is needed, explain the required repair or blocker and output exactly this as the final non-empty line:
 <<<GIGAFLEX:FINALIZE_FAILED>>>
 
 Bounded current-run progress snapshot: {progress_file}

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
+import json
 from pathlib import Path
 import time
 from typing import Callable, Iterator, Optional
@@ -60,6 +61,7 @@ from .signals import (
     TASK_FAILED,
 )
 from .stats import statistics_path
+from .validation import RepositoryState, ValidationCommand, repository_state, run_validation
 
 
 CORE_REVIEW_AGENTS = ("quality", "implementation")
@@ -88,6 +90,7 @@ class RunOptions:
     allow_dirty: bool = False
     resume: bool = False
     resume_note: str = ""
+    validation_commands: tuple[ValidationCommand, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,8 @@ class Runner:
         self._active_cwd: Optional[Path] = None
         self._latest_review_verification_records: tuple[ReviewDecisionRecord, ...] = ()
         self._pending_task_recovery: Optional[dict[str, object]] = None
+        self._pending_phase_recovery: Optional[dict[str, object]] = None
+        self._reviewed_state: Optional[RepositoryState] = None
 
     def run(self) -> None:
         if self.options.dry_run:
@@ -151,9 +156,14 @@ class Runner:
                 )
             recovery = blocked.get("task_recovery")
             if recovery:
-                if self.options.review_only or self.task_worktrees is None:
+                if recovery.get("phase", "task") != "task":
+                    if self.options.tasks_only or self.task_worktrees is None:
+                        raise ResumeError("saved review/finalize work requires a full or review run")
+                    self._pending_phase_recovery = dict(recovery)
+                elif self.options.review_only or self.task_worktrees is None:
                     raise ResumeError("saved task work must be resumed in task mode")
-                self._pending_task_recovery = dict(recovery)
+                else:
+                    self._pending_task_recovery = dict(recovery)
             elif self.checkpoint is not None:
                 self.checkpoint.clear_blocked()
         if not self.options.review_only:
@@ -171,12 +181,24 @@ class Runner:
             self.log.section("done")
             self.log.write("task execution completed\n")
             return
+        if self._pending_phase_recovery is not None:
+            recovery = self._pending_phase_recovery
+            if recovery.get("phase") == "synthesis":
+                self._run_synthesis(recovery["phase_context"]["findings"], recovery=recovery)
+            elif recovery.get("phase") == "finalize":
+                self._finalize_candidate(recovery=recovery, may_repair=True)
+            else:
+                raise ResumeError("unknown saved execution phase; saved work has been retained")
+            self._pending_phase_recovery = None
         review_reused = False
         if self.checkpoint is not None and not self.options.review_only:
             review_state = self.checkpoint.current_state()
             review_reused = self.checkpoint.can_reuse("review", review_state)
+            if review_reused and self._run_checks("review"):
+                review_reused = False
         if review_reused:
             self._log_checkpoint_reuse("review")
+            self._reviewed_state = self._state()
         else:
             if self.checkpoint is not None:
                 self.checkpoint.invalidate_from("review")
@@ -195,6 +217,8 @@ class Runner:
                     "finalize",
                     finalize_state,
                 )
+                if finalize_reused and self._run_checks("finalize"):
+                    finalize_reused = False
             if finalize_reused:
                 self._log_checkpoint_reuse("finalize")
             else:
@@ -207,6 +231,18 @@ class Runner:
                         "finalize",
                         self.checkpoint.current_state(),
                     )
+
+        self._assert_state(self._reviewed_state, "completed result")
+        report = {"repository": asdict(self._reviewed_state) if self._reviewed_state else None,
+                  "review": "passed", "finalize": "passed" if self.options.finalize_enabled else "disabled"}
+        self.log.diagnostic("session=verification report=" + json.dumps(report))
+        if self.dashboard is not None:
+            self.dashboard.result_verified(report)
+
+    @property
+    def verified_state(self) -> Optional[RepositoryState]:
+        self._assert_state(self._reviewed_state, "completed result")
+        return self._reviewed_state
 
     def _log_checkpoint_reuse(self, phase: str) -> None:
         self.log.section(f"{phase} checkpoint")
@@ -301,7 +337,7 @@ class Runner:
         task_label = self._task_label(selected_task)
         if resumed:
             status = self._task_completion_status(selected_task, plan_before, context_before, head_before, dirty_before)
-            if status.complete and not self.options.resume_note:
+            if status.complete and not self.options.resume_note and not self._run_checks("task"):
                 self.log.write(f"saved task {task_label} already satisfies completion checks; retrying promotion\n")
                 return ExecResult(output="saved task completion verified", returncode=0)
             if not status.repairable:
@@ -407,6 +443,22 @@ class Runner:
             dirty_before,
             completion_retries,
         )
+        for attempt in range(max(0, self.options.task_completion_retries) + 1):
+            errors = self._run_checks("task")
+            if not errors:
+                break
+            if attempt == max(0, self.options.task_completion_retries):
+                raise RuntimeError("task runner validation failed: " + "; ".join(errors))
+            current = self._matching_task(self._parse_plan_file(), selected_task)
+            result = self._run_task_agent(render_task_completion_retry_prompt(
+                prompt, self.options.plan_file, selected_task.number, selected_task.title,
+                current.section, current.has_implicit_tracking, validation_errors=tuple(errors),
+            ), retry_guard=lambda _result: self._prepare_task_retry(
+                selected_task, plan_before, context_before, head_before, dirty_before,
+            ))
+            self._prefix_new_commits(head_before, "task validation repair")
+            self._accept_task_result_or_raise(result, selected_task, plan_before, context_before, head_before, dirty_before)
+            self._validate_completed_task_iteration(selected_task, plan_before, context_before, head_before, dirty_before)
         return result
 
     def run_review(self) -> None:
@@ -447,6 +499,7 @@ class Runner:
                 active_scope,
                 terminal_verification=terminal_verification,
             )
+            reviewed_before = self._state()
             head_before = self._git().head_commit()
             result = self._run_single_review_agent(
                 "review",
@@ -463,6 +516,7 @@ class Runner:
                 ),
             )
             self._prefix_new_commits(head_before, "review")
+            self._assert_state(reviewed_before, "read-only review")
             if not result.ok:
                 raise RuntimeError(describe_failure("gigacode review session", result))
             if result.signal == TASK_FAILED:
@@ -471,8 +525,14 @@ class Runner:
                 "review",
                 result,
             )
-            identified = identify_review_findings({"review": structured_output})
+            findings = {"review": structured_output}
+            check_errors = self._run_checks("review")
+            self._assert_state(reviewed_before, "review validation")
+            if check_errors:
+                findings["runner_validation"] = self._validation_finding(check_errors)
+            identified = identify_review_findings(findings)
             if not identified:
+                self._reviewed_state = reviewed_before
                 self.log.diagnostic(
                     "session=review event=no_findings action=skip_synthesis"
                 )
@@ -497,15 +557,8 @@ class Runner:
                 self.dashboard.review_synthesis_started(iteration, len(identified))
             head_before = self._git().head_commit()
             dirty_before = self._safe_uncommitted_paths()
-            synthesis = self.synthesis_executor.run(
-                self._render_review_synthesis_prompt({"review": structured_output}, context)
-            )
-            self._prefix_new_commits(head_before, "review synthesis")
-            if not synthesis.ok:
-                raise RuntimeError(describe_failure("gigacode review synthesis", synthesis))
-            if synthesis.signal == TASK_FAILED:
-                raise RuntimeError("review failed")
-            if self._accept_review_synthesis_or_raise(synthesis, {"review": structured_output}):
+            if self._run_synthesis(findings):
+                self._reviewed_state = self._state()
                 if self.dashboard is not None:
                     self.dashboard.review_attempt_finished(
                         iteration,
@@ -571,12 +624,14 @@ class Runner:
                 active_scope,
                 terminal_verification=terminal_verification,
             )
+            reviewed_before = self._state()
             head_before = self._git().head_commit()
             results = self._run_parallel_review_agents(
                 selected_agents,
                 followup_scope=active_scope,
             )
             self._prefix_new_commits(head_before, "parallel review")
+            self._assert_state(reviewed_before, "read-only review")
             findings: dict[str, str] = {}
             for name in selected_agents:
                 result = results[name]
@@ -588,8 +643,13 @@ class Runner:
                     raise RuntimeError(describe_failure(f"gigacode review agent {name}", result))
                 findings[name] = self._structured_review_output(name, result)
 
+            check_errors = self._run_checks("review")
+            self._assert_state(reviewed_before, "review validation")
+            if check_errors:
+                findings["runner_validation"] = self._validation_finding(check_errors)
             identified = identify_review_findings(findings)
             if not identified:
+                self._reviewed_state = reviewed_before
                 self.log.diagnostic(
                     "session=review event=no_findings action=skip_synthesis"
                 )
@@ -614,15 +674,8 @@ class Runner:
                 self.dashboard.review_synthesis_started(iteration, len(identified))
             head_before = self._git().head_commit()
             dirty_before = self._safe_uncommitted_paths()
-            synthesis = self.synthesis_executor.run(
-                self._render_review_synthesis_prompt(findings, context)
-            )
-            self._prefix_new_commits(head_before, "review synthesis")
-            if not synthesis.ok:
-                raise RuntimeError(describe_failure("gigacode review synthesis", synthesis))
-            if synthesis.signal == TASK_FAILED:
-                raise RuntimeError("review failed")
-            if self._accept_review_synthesis_or_raise(synthesis, findings):
+            if self._run_synthesis(findings):
+                self._reviewed_state = self._state()
                 if self.dashboard is not None:
                     self.dashboard.review_attempt_finished(
                         iteration,
@@ -762,26 +815,274 @@ class Runner:
             if name in CORE_REVIEW_AGENTS or name in relevant
         )
 
-    def run_finalize(self) -> None:
+    def _state(self) -> Optional[RepositoryState]:
+        git = self._git()
+        if not git.is_repo() or not git.head_commit():
+            return None
+        root = git.repo_root()
+        excluded = [self.options.progress_file, self.log.prompt_context_file,
+                    statistics_path(self.options.progress_file)]
+        if self.checkpoint is not None:
+            excluded.append(self.checkpoint.path)
         if self.dashboard is not None:
-            self.dashboard.phase_started("finalize", "Running final verification")
-        self.log.section("finalize")
-        head_before = self._git().head_commit()
-        dirty_before = self._uncommitted_paths()
-        result = self.finalize_executor.run(render(self.options.prompts.finalize, self._context()))
-        self._prefix_new_commits(head_before, "finalize")
+            excluded.extend((self.dashboard.json_path, self.dashboard.html_path))
+        paths = tuple(path.resolve().relative_to(root) for path in excluded if path.resolve().is_relative_to(root))
+        return repository_state(git, paths)
+
+    def _assert_state(self, expected: Optional[RepositoryState], phase: str) -> None:
+        if expected is not None and self._state() != expected:
+            raise RuntimeError(f"{phase} changed HEAD, file contents, or staged state; the result was not verified")
+
+    def _run_checks(self, phase: str) -> list[str]:
+        commands = [command for command in self.options.validation_commands if phase in command.phases]
+        if not commands:
+            self.log.diagnostic(f"session=validation phase={phase} status=not_configured evidence=agent_report_and_repository_checks")
+            if self.dashboard is not None:
+                self.dashboard.validation_finished({"phase": phase, "status": "not_configured", "checks": []})
+            return []
+        expected = self._state()
+        if self._active_cwd is None and self.task_worktrees is not None:
+            manager = ReviewWorktreeManager(self._git())
+            with manager.create(["validation"], base_ref=self.options.default_branch) as worktrees:
+                root = worktrees.paths["validation"]
+                results = self._execute_checks(commands, root)
+        else:
+            results = self._execute_checks(commands, self._git().repo_root())
+        self._assert_state(expected, "runner validation")
+        report = {"phase": phase, "repository": asdict(expected) if expected else None, "checks": results,
+                  "status": "passed" if all(item["status"] == "passed" for item in results) else "failed"}
+        self.log.diagnostic("session=validation report=" + json.dumps(report, ensure_ascii=False))
+        if self.dashboard is not None:
+            self.dashboard.validation_finished(report)
+        return [f"{item['name']}: {item['status']} (exit {item['returncode']})\n{str(item['output'])[-4000:]}"
+                for item in results if item["status"] != "passed"]
+
+    @staticmethod
+    def _execute_checks(commands, root: Path) -> list[dict[str, object]]:
+        git = GitService(root)
+        results = []
+        for command in commands:
+            before = repository_state(git)
+            result = run_validation(command, root)
+            changed = repository_state(git) != before
+            if changed:
+                result["status"] = "failed"
+                result["output"] = str(result["output"]) + "\nValidation command modified repository content or index."
+            results.append(result)
+            if changed:
+                break
+        return results
+
+    @staticmethod
+    def _validation_finding(errors: list[str]) -> str:
+        evidence = " ".join("; ".join(errors).split()).replace("<", "[").replace(">", "]")[:6000]
+        return (
+            "<FINDING>\nseverity: major\ncategory: correctness\nfile: .gigaflex/config\nline: 1\n"
+            f"evidence: Runner-owned validation failed: {evidence}\n"
+            "impact: The current result does not satisfy the configured project checks.\n"
+            "suggested_fix: Fix the deliverable and pass the original configured checks without weakening them.\n</FINDING>"
+        )
+
+    def _phase_protected(self) -> dict[Path, bytes]:
+        protected = self._plan_context_snapshot()
+        if self.options.plan_file is not None:
+            protected[self.options.plan_file] = self.options.plan_file.read_bytes()
+        return protected
+
+    def _phase_errors(self, before: Optional[RepositoryState], protected: dict[Path, bytes], phase: str) -> list[str]:
+        errors = []
+        try:
+            same_contract = self._phase_protected() == protected
+        except (OSError, UnicodeError):
+            same_contract = False
+        if not same_contract:
+            errors.append("modified protected plan or OpenSpec context")
+        current = self._state()
+        if self._active_cwd is not None:
+            dirty = self._uncommitted_paths()
+            if dirty:
+                errors.append("uncommitted phase output: " + ", ".join(self._display_path(path) for path in sorted(dirty)))
+        elif current is not None and before is not None and current != before:
+            # Legacy direct Runner callers still cannot accept newly dirty state,
+            # including changes to a path that was already dirty at entry.
+            if current.tree != self._git().tree_id("HEAD") or current.index != self._git().tree_id("HEAD"):
+                errors.append("phase changed content or staged state without a clean committed result")
+        if not errors:
+            errors.extend(self._run_checks(phase))
+        return errors
+
+    def _restore_phase_contract(self, protected: dict[Path, bytes]) -> None:
+        if self._active_cwd is None:
+            return
+        if self.options.plan_file is not None:
+            self._restore_task_contract(
+                protected[self.options.plan_file].decode("utf-8"),
+                {path: content for path, content in protected.items() if path != self.options.plan_file},
+            )
+
+    def _run_synthesis_agent(self, prompt: str) -> ExecResult:
+        if self._active_cwd is None:
+            return self.synthesis_executor.run(prompt)
+        return self.synthesis_executor.run(prompt, cwd=self._active_cwd)
+
+    def _execute_synthesis(self, findings, before, protected) -> bool:
+        prompt = self._render_review_synthesis_prompt(findings, self._context())
+        errors = []
+        for attempt in range(max(0, self.options.task_completion_retries) + 1):
+            if errors:
+                self._restore_phase_contract(protected)
+            correction = "\n\nCorrect this same candidate and return a complete finding ledger. " \
+                         "Validate and commit required deliverables; remove only verified disposable outputs. " \
+                         "Preserve the original plan and context.\n" + "\n".join(errors) if errors else ""
+            result = self._run_synthesis_agent(prompt + correction)
+            if before is not None:
+                self._prefix_new_commits(before.head, "review synthesis")
+            if not result.ok or result.signal == TASK_FAILED:
+                raise RuntimeError(describe_failure("gigacode review synthesis", result))
+            completed = self._accept_review_synthesis_or_raise(result, findings)
+            errors = self._phase_errors(before, protected, "review")
+            if not errors:
+                # Even an all-rejected ledger cannot approve code it just changed.
+                return completed and self._state() == before
+            self.log.diagnostic(f"session=review-synthesis event=completion_rejected attempt={attempt} errors={errors!r}")
+        raise RuntimeError("review synthesis did not complete its candidate: " + "; ".join(errors))
+
+    def _run_synthesis(self, findings, *, recovery=None) -> bool:
+        if self.task_worktrees is None:
+            return self._execute_synthesis(findings, self._state(), self._phase_protected())
+        original_protected = self._phase_protected()
+        context = (self.task_worktrees.resume("review synthesis", recovery) if recovery
+                   else self.task_worktrees.create("review synthesis"))
+        with context as workspace:
+            workspace.phase = "synthesis"
+            workspace.phase_context = {"findings": findings}
+            with self._use_task_workspace(workspace):
+                protected = ({workspace.path / path.resolve().relative_to(workspace.repo_root): content
+                              for path, content in original_protected.items()} if recovery else self._phase_protected())
+                tree = self._git().tree_id(workspace.snapshot_commit)
+                before = RepositoryState(workspace.snapshot_commit, tree, tree)
+                if recovery:
+                    self._restore_phase_contract(protected)
+                completed = self._execute_synthesis(findings, before, protected)
+                changed = self._state() != before
+                head = self._git().head_commit()
+            if changed:
+                workspace.promote(head)
+                self._reviewed_state = None
+            else:
+                workspace.discard_verified()
+            if self.checkpoint is not None:
+                self.checkpoint.clear_blocked()
+            return completed and not changed
+
+    def run_finalize(self) -> None:
+        if self._reviewed_state is not None:
+            self._assert_state(self._reviewed_state, "state after review")
+        if self.task_worktrees is None:
+            before = self._state()
+            result = self.finalize_executor.run(render(self.options.prompts.finalize, self._context()))
+            self._assert_state(before, "finalize")
+            self._validate_finalize_signal(result)
+            errors = self._run_checks("finalize")
+            if errors:
+                raise RuntimeError("finalize validation failed: " + "; ".join(errors))
+            return
+        retries = max(0, self.options.task_completion_retries)
+        for attempt in range(retries + 1):
+            if self.dashboard is not None:
+                self.dashboard.phase_started("finalize", "Verifying the reviewed result")
+            self.log.section("finalize")
+            repaired = self._finalize_candidate(may_repair=attempt < retries)
+            if not repaired:
+                self._assert_state(self._reviewed_state, "finalize verification")
+                return
+            # Every finalize edit is a repair candidate, never final approval.
+            if self.checkpoint is not None:
+                self.checkpoint.invalidate_from("review")
+                self.checkpoint.mark_started("review")
+            self.run_review()
+            if self.checkpoint is not None:
+                self.checkpoint.mark_completed("review", self.checkpoint.current_state())
+        raise RuntimeError("finalize repair budget exhausted")
+
+    @staticmethod
+    def _validate_finalize_signal(result: ExecResult) -> None:
         if not result.ok:
             raise RuntimeError(describe_failure("gigacode finalize session", result))
         if result.signal == FINALIZE_FAILED:
-            raise RuntimeError("finalize failed")
+            raise RuntimeError("finalize failed: " + result.output[-4000:])
         if result.signal != FINALIZE_DONE:
             raise RuntimeError("finalize did not report successful verification")
-        new_dirty = self._uncommitted_paths() - dirty_before
-        if new_dirty:
-            if self.options.allow_dirty:
-                self._log_allowed_dirty("finalize", new_dirty)
+
+    def _finalize_candidate(self, *, recovery=None, may_repair: bool) -> bool:
+        original_protected = self._phase_protected()
+        context = (self.task_worktrees.resume("finalize", recovery) if recovery
+                   else self.task_worktrees.create("finalize"))
+        with context as workspace:
+            workspace.phase = "finalize"
+            with self._use_task_workspace(workspace):
+                tree = self._git().tree_id(workspace.snapshot_commit)
+                before = RepositoryState(workspace.snapshot_commit, tree, tree)
+                protected = ({workspace.path / path.resolve().relative_to(workspace.repo_root): content
+                              for path, content in original_protected.items()} if recovery else self._phase_protected())
+                result = self.finalize_executor.run(
+                    render(self.options.prompts.finalize, self._context())
+                    + "\nRunner verification boundary: inspect this fixed candidate without changing HEAD, "
+                    "the index, tracked files, plan, or non-ignored untracked files. "
+                    "Report required repairs; do not implement them during final verification.\n",
+                    cwd=workspace.path,
+                )
+                signal_error = ""
+                try:
+                    self._validate_finalize_signal(result)
+                except RuntimeError as exc:
+                    signal_error = str(exc)
+                changed = self._state() != before
+                errors = self._phase_errors(before, protected, "finalize")
+                if not changed and not errors and not signal_error:
+                    accepted = True
+                else:
+                    accepted = False
+                    if not may_repair:
+                        raise RuntimeError("finalize requires repair after its retry budget: "
+                                           + "; ".join(errors + [signal_error or "finalize modified the verified candidate"]))
+                    reason = "\n".join(errors + [signal_error or "finalize modified the verified candidate"])
+                    workspace.phase_context = {"failure": reason}
+                    # Clean committed edits still need review; incomplete edits or
+                    # failed checks first go through the repair executor here.
+                    for correction in range(max(0, self.options.task_completion_retries) + 1):
+                        if not errors and not signal_error:
+                            break
+                        self._restore_phase_contract(protected)
+                        repair = self._run_synthesis_agent(
+                            "Phase: repair the final verification candidate.\n"
+                            "Fix the underlying deliverable, preserve the original plan and context, "
+                            "run its checks and commit the correction. Do not change orchestration files.\n"
+                            "Preserve useful prior work; remove only verified disposable outputs.\n"
+                            "The candidate will undergo fresh review and final verification.\n"
+                            "Untrusted verification diagnostics:\n" + reason
+                            + ("\nOperator context: " + self.options.resume_note if self.options.resume_note else "")
+                        )
+                        if not repair.ok or repair.signal == TASK_FAILED:
+                            raise RuntimeError(describe_failure("final verification repair", repair))
+                        self._prefix_new_commits(before.head, "final verification repair")
+                        signal_error = ""
+                        errors = self._phase_errors(before, protected, "finalize")
+                        reason = "\n".join(errors)
+                        if not errors:
+                            break
+                    if errors:
+                        raise RuntimeError("final verification repair incomplete: " + "; ".join(errors))
+                changed = self._state() != before
+                head = self._git().head_commit()
+            if changed:
+                workspace.promote(head)
+                self._reviewed_state = None
             else:
-                raise RuntimeError("finalize left new uncommitted changes in the working tree")
+                workspace.discard_verified()
+            if self.checkpoint is not None:
+                self.checkpoint.clear_blocked()
+            return not accepted
 
     def print_prompts(self) -> None:
         context = self._context()
@@ -1347,10 +1648,14 @@ class Runner:
                 worktrees.repo_root,
                 worktrees.review_manifest,
             )
-            return self.review_agent_executor.run(
+            before = repository_state(GitService(worktree))
+            result = self.review_agent_executor.run(
                 render_prompt(context),
                 cwd=worktree,
             )
+            if repository_state(GitService(worktree)) != before:
+                raise RuntimeError("read-only review modified its isolated candidate")
+            return result
 
     def _run_parallel_review_agents(
         self,
@@ -1399,15 +1704,20 @@ class Runner:
                 )
                 for name, focus in agents.items()
             }
+            before = {name: repository_state(GitService(path)) for name, path in worktrees.paths.items()}
             results = self.review_agent_executor.run_batch(
                 prompts,
                 workdirs=worktrees.paths,
             )
-            return self._retry_crashed_review_agents(
+            results = self._retry_crashed_review_agents(
                 prompts,
                 results,
                 workdirs=worktrees.paths,
             )
+            for name, path in worktrees.paths.items():
+                if repository_state(GitService(path)) != before[name]:
+                    raise RuntimeError(f"read-only reviewer {name} modified its isolated candidate")
+            return results
 
     def _retry_crashed_review_agents(
         self,
@@ -1541,7 +1851,7 @@ class Runner:
             )
             self.log.section("review synthesis reconciliation")
             head_before = self._git().head_commit()
-            recovery = self.synthesis_executor.run(
+            recovery = self._run_synthesis_agent(
                 render_review_synthesis_recovery_prompt(
                     self.options.prompts.review_synthesis,
                     findings,
@@ -1610,7 +1920,7 @@ class Runner:
             )
             self.log.section("review synthesis blocked audit")
             head_before = self._git().head_commit()
-            audit = self.synthesis_executor.run(
+            audit = self._run_synthesis_agent(
                 render_review_synthesis_blocked_audit_prompt(
                     self.options.prompts.review_synthesis,
                     findings,

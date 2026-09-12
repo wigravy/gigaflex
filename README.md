@@ -477,12 +477,13 @@ Review behavior:
   that file instead of rebuilding the repository-wide diff, and it is removed
   with the disposable review worktrees after both successful and failed review
   batches
-- synthesis uses `task_model`, verifies reported findings, and is the only
-  stage that may fix, test, and commit deliverable changes; runner-owned plan,
-  progress, prompt-context, checkpoint, status, and statistics files remain
-  read-only during synthesis
-- finalize runs after a successful review by default; pass `--no-finalize` to
-  skip the final validation/cleanup pass
+- synthesis uses `task_model` in one isolated candidate. Dirty or incomplete
+  output receives a bounded corrective retry in that same candidate. Only a
+  clean committed candidate is promoted, and every promoted fix receives a
+  fresh review; runner-owned plan and context remain read-only
+- finalize runs read-only after a successful review by default. Repairs happen
+  in an isolated candidate, followed by fresh review and another finalize pass;
+  pass `--no-finalize` to skip this verification
 - fallback: pass `--no-parallel-review` to use one read-only reviewer followed
   by the same synthesis stage
 - limit fan-out with `--review-workers N`
@@ -544,6 +545,8 @@ wait_on_rate_limit =
 review_workers = 5
 review_iterations = 10
 finalize_enabled = true
+# JSON argv arrays run directly, without a shell.
+# validation_commands = [{"name":"tests","argv":["python3","-m","unittest","discover","-s","tests"],"cwd":".","timeout":300,"phases":["review","finalize"]}]
 create_branch = true
 worktree = false
 move_plan_on_completion = true
@@ -601,11 +604,12 @@ Git behavior:
 - every isolated task must finish with no uncommitted changes, even when
   `--allow-dirty` permitted user changes in the main checkout; leftover task
   files receive a corrective retry before the result can be promoted
-- `--allow-dirty` still permits new uncommitted paths left by finalize; this
-  override does not relax isolated task completion requirements
+- `--allow-dirty` never permits a phase to leave new uncommitted output;
+  synthesis and finalize use the same recoverable isolated-candidate boundary
 - with `--allow-dirty`, review prompts include committed, staged, unstaged, and
   untracked changes via `git status --short`, `git diff --cached`, and `git diff`
-- completed full runs move the plan file to `completed/`
+- completed full runs move the plan file to `completed/` in a separate checked
+  commit that may change only the source and destination plan paths
 - use `--no-branch` or `--no-move-plan` to disable those steps
 
 Prompt customization:

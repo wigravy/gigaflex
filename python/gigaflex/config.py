@@ -10,6 +10,7 @@ from typing import Optional
 from .defaults import DEFAULT_GIGACODE_ARGS, DEFAULT_GIGACODE_INTERACTIVE_ARGS
 from .executor import DEFAULT_RATE_LIMIT_PATTERNS, DEFAULT_TRANSIENT_RETRY_PATTERNS
 from .prompts import init_prompt_templates, sync_global_prompt_templates
+from .validation import ValidationCommand, parse_validation_commands
 
 
 GLOBAL_CONFIG_RELATIVE_DIR = Path(".config/gigaflex")
@@ -49,6 +50,7 @@ class Config:
     move_plan_on_completion: bool = True
     commit_plan_on_creation: bool = True
     allow_dirty: bool = False
+    validation_commands: tuple[ValidationCommand, ...] = ()
 
     @property
     def resolved_args(self) -> list[str]:
@@ -151,6 +153,8 @@ def load_config(path: Optional[Path] = None) -> Config:
     cfg.move_plan_on_completion = section.getboolean("move_plan_on_completion", cfg.move_plan_on_completion)
     cfg.commit_plan_on_creation = section.getboolean("commit_plan_on_creation", cfg.commit_plan_on_creation)
     cfg.allow_dirty = section.getboolean("allow_dirty", cfg.allow_dirty)
+    if "validation_commands" in section:
+        cfg.validation_commands = parse_validation_commands(section.get("validation_commands", raw=True))
     return _apply_env(cfg)
 
 
@@ -274,6 +278,8 @@ DEFAULT_CONFIG_TEXT = """[gigaflex]
 # Maximum synthesis/repair cycles; one terminal verification runs afterward.
 # review_iterations = 10
 # finalize_enabled = true
+# Explicit argv, never a shell string. Default phases: review and finalize.
+# validation_commands = [{"name":"tests","argv":["python3","-m","unittest","discover","-s","tests"],"cwd":".","timeout":300}]
 # session_timeout = 1800
 # idle_timeout = 900
 # retry_count = 1

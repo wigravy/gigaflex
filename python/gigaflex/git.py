@@ -775,11 +775,21 @@ class TaskWorktree:
     original_index_tree: str = ""
     original_branch: str = ""
     resumed: bool = False
+    phase: str = "task"
+    phase_context: dict[str, object] = field(default_factory=dict)
+    verified: bool = field(default=False, init=False)
     promoted: bool = field(default=False, init=False)
     recovery_path: Optional[Path] = field(default=None, init=False)
 
     def promote(self, task_head: str) -> list[str]:
         return self.manager.promote(self, task_head)
+
+    def discard_verified(self) -> None:
+        git = GitService(self.path)
+        if git.head_commit() != self.snapshot_commit or git.is_dirty():
+            raise GitError("cannot discard a verification workspace containing changes")
+        self.manager._assert_main_unchanged(self, "verified.index")
+        self.verified = True
 
 
 @dataclass
@@ -951,6 +961,8 @@ class TaskWorktreeManager:
         workspace: TaskWorktree,
         index_name: str,
     ) -> None:
+        if workspace.original_index_tree and self.git.run("write-tree").stdout.strip() != workspace.original_index_tree:
+            raise GitError("main index changed while the isolated task was running")
         if self.git.head_commit() != workspace.base_commit:
             raise GitError(
                 "main HEAD changed while the isolated task was running; "
@@ -1066,7 +1078,7 @@ class _TaskWorktreeContext:
 
     def _finish(self, exc) -> None:
         recovery_notice = ""
-        if self.workspace is not None and not self.workspace.promoted:
+        if self.workspace is not None and not (self.workspace.promoted or self.workspace.verified):
             from .task_recovery import save_task_recovery, task_interruption
 
             try:

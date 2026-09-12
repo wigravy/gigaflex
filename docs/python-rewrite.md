@@ -12,7 +12,8 @@
 - Create gigaflex-compatible plans from a free-form request.
 - Commit newly created plan files by default when running inside a git
   repository.
-- Commit completed plan moves after a successful full run.
+- Commit completed plan moves after a successful full run in a separate
+  plan-only transaction bound to the verified repository state.
 - Install `.gitignore` entries for `.DS_Store` and `/.gigaflex/` during
   project initialization.
 - Optionally initialize a missing git repository with `--init-git` and commit
@@ -37,11 +38,19 @@
 - Record per-attempt timing, model, token usage, retry decisions, and final run
   status in a statistics JSON file.
 - Detect gigaflex completion signals.
-- Run a review loop after tasks.
+- Run a review loop after tasks. Review agents are read-only and their detached
+  worktrees are checked for HEAD, content, and index mutations.
 - Run five specialist review agents in parallel from disposable detached
   worktrees built from one ephemeral working-tree snapshot, remove those
   worktrees after every pass, then synthesize/fix findings in the main worktree.
-- Run a finalize prompt by default, with `--no-finalize` to disable it.
+- Run synthesis and finalize repairs in recoverable isolated candidates. Promote
+  only clean commits and require a fresh review after every promoted repair.
+- Run finalize as a read-only verification prompt by default, with
+  `--no-finalize` to disable it.
+- Run optional structured `validation_commands` directly without a shell, with
+  per-command working directory, timeout, and task/review/finalize phases.
+  Bind reports to the checked HEAD, tree, and index and show them separately
+  from agent evidence in the terminal log and dashboard.
 - Configure the agent command as `gigacode` plus arbitrary CLI args.
 - Select GigaCode models per phase with `plan_model`, `task_model`,
   `review_model`, and `finalize_model`, mapped to GigaCode's `--model` flag.

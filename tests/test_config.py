@@ -13,6 +13,18 @@ from gigaflex.prompts import DEFAULT_PROMPTS
 
 
 class ConfigTest(unittest.TestCase):
+    def test_loads_structured_validation_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config"
+            path.write_text(
+                '[gigaflex]\nvalidation_commands = [{"name":"tests","argv":["python3","-m","unittest"],"cwd":"python","timeout":12,"phases":["task","review"]}]\n',
+                encoding="utf-8",
+            )
+            command, = load_config(path).validation_commands
+            self.assertEqual("tests", command.name)
+            self.assertEqual(("python3", "-m", "unittest"), command.argv)
+            self.assertEqual(("task", "review"), command.phases)
+
     def test_default_args_enable_noninteractive_auto_edit(self) -> None:
         self.assertEqual(
             [

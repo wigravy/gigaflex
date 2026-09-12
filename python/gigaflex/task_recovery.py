@@ -35,6 +35,8 @@ def workspace_record(workspace: TaskWorktree, label: str) -> dict[str, object]:
         "original_dirty_paths": sorted(str(path) for path in workspace.original_dirty_paths),
         "original_index_tree": workspace.original_index_tree,
         "original_branch": workspace.original_branch,
+        "phase": workspace.phase,
+        "phase_context": workspace.phase_context,
     }
 
 
@@ -173,6 +175,7 @@ def restore_task_recovery(
             frozenset(Path(value) for value in manifest["original_dirty_paths"]),
             original_index_tree=manifest["original_index_tree"],
             original_branch=manifest["original_branch"], resumed=True,
+            phase=manifest.get("phase", "task"), phase_context=manifest.get("phase_context", {}),
         )
         temporary_refs = []
         try:

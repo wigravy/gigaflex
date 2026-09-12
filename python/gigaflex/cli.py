@@ -26,7 +26,6 @@ from .git import (
     TaskWorktreeManager,
     branch_name_from_plan,
     jira_branch_name,
-    move_plan_to_completed,
 )
 from .planner import clean_plan_output, next_plan_path
 from .plan import (
@@ -45,6 +44,7 @@ from .skills import (
     planning_skill_path,
 )
 from .stats import RunStatistics, statistics_path
+from .archive import archive_plan
 
 
 JIRA_TASK_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]*-\d+|\d+)$")
@@ -503,7 +503,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ):
         return 0
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except ValueError as exc:
+        print(f"error: invalid configuration: {exc}", file=sys.stderr)
+        return 2
     prompts = load_prompt_templates(cfg.prompt_dirs)
 
     if args.gigacode_command:
@@ -950,6 +954,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         allow_dirty=cfg.allow_dirty,
         resume=args.resume,
         resume_note=args.resume_note,
+        validation_commands=cfg.validation_commands,
     )
     review_worktrees = (
         None
@@ -975,7 +980,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     task_worktrees = (
         None
-        if args.dry_run or args.review
+        if args.dry_run
         else TaskWorktreeManager(
             git,
             diagnostic=log.diagnostic,
@@ -999,7 +1004,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     failure_reason = ""
     failure_phase = ""
     try:
-        Runner(
+        stopped_recovery = checkpoint.blocked.get("task_recovery") if checkpoint is not None else None
+        archive_recovery = stopped_recovery if stopped_recovery and stopped_recovery.get("phase") == "archive" else None
+        if archive_recovery and (not args.resume or not cfg.move_plan_on_completion or args.tasks_only or args.review):
+            raise ResumeError("resume the saved plan archive with the original full-run command")
+        runner = Runner(
             options,
             task_executor,
             log,
@@ -1010,7 +1019,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             review_worktrees=review_worktrees,
             task_worktrees=task_worktrees,
             checkpoint=checkpoint,
-        ).run()
+        )
+        if archive_recovery is None:
+            runner.run()
         if (
             not args.dry_run
             and cfg.move_plan_on_completion
@@ -1019,13 +1030,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             and not args.review
             and not args.tasks_only
         ):
-            moved_to = move_plan_to_completed(plan_file)
+            moved_to = archive_plan(
+                task_worktrees, plan_file, completed_plan_commit_message(plan_file, args.jira_task),
+                recovery=archive_recovery,
+                expected=runner.verified_state if archive_recovery is None else None,
+            )
             log.section("plan")
             log.write(f"moved completed plan to {moved_to}\n")
-            if git.is_repo():
-                message = completed_plan_commit_message(plan_file, args.jira_task)
-                git.commit_paths([plan_file, moved_to], message)
-                log.write(f"committed completed plan move: {message}\n")
+            log.write("verified and committed the plan-only archive transaction\n")
+            if checkpoint is not None:
+                checkpoint.clear_blocked()
         if (
             not args.dry_run
             and plan_source is not None
