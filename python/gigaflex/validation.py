@@ -85,13 +85,15 @@ def run_validation(command: ValidationCommand, root: Path) -> dict[str, object]:
         except OSError as exc:
             result["output"] = str(exc)
         finally:
-            if process is not None and process.poll() is None:
+            if process is not None:
                 if os.name != "nt":
+                    # The group can still contain children after its leader
+                    # exits. They must not outlive the validation boundary.
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                else:
+                elif process.poll() is None:
                     process.kill()
                 process.wait()
             output.seek(0, 2)

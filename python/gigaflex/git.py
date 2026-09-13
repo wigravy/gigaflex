@@ -1249,16 +1249,23 @@ def worktree_dir_name(branch: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-") or "plan"
 
 
-def move_plan_to_completed(plan_file: Path) -> Path:
+def completed_plan_path(plan_file: Path) -> Path:
     completed_dir = plan_file.parent / "completed"
-    completed_dir.mkdir(parents=True, exist_ok=True)
     target = completed_dir / plan_file.name
-    if target.exists():
+    if target.exists() or target.is_symlink():
         stem = target.stem
         suffix = target.suffix
         index = 2
-        while target.exists():
+        while target.exists() or target.is_symlink():
             target = completed_dir / f"{stem}-{index}{suffix}"
             index += 1
+    return target
+
+
+def move_plan_to_completed(plan_file: Path, *, target: Optional[Path] = None) -> Path:
+    target = target or completed_plan_path(plan_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        raise GitError(f"plan archive destination already exists: {target}")
     shutil.move(str(plan_file), str(target))
     return target
