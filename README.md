@@ -21,6 +21,8 @@ This is a small standalone rewrite of the useful ralphex core:
   its validated linear commits; dirty paths touched by the task are adopted
   wholesale into its first commit, while untouched dirty paths retain their
   staged, unstaged, or untracked state
+- carry explicitly configured ignored skill artifacts between isolated tasks
+  without staging or committing them
 - keep detailed agent output in progress logs, provide agents only a bounded
   current-run snapshot, and generate a live local dashboard
 - persist successful phase checkpoints and resume interrupted runs without
@@ -104,8 +106,10 @@ and recorded in the progress log. For a normal checkout it is
 Git directory. Each directory contains a verified `task.bundle`, a manifest,
 and `README.txt` with commands to reconstruct the failed task in a new worktree.
 The bundle preserves task commits, the index, tracked working-tree changes,
-and non-ignored untracked files; ignored untracked files and external files are
-excluded. It requires the original repository base commit. Recovery does not
+and non-ignored untracked files. Configured ignored task artifacts are saved
+alongside the bundle in `artifacts-input/` and `artifacts-worktree/` and restored
+automatically by `--resume`; other ignored untracked files and external files
+are excluded. It requires the original repository base commit. Recovery does not
 apply changes to the execution branch. Bundles remain until manually removed.
 If recovery cannot be saved, the task worktree is retained and its path is
 reported instead of deleting the only copy. This also applies to populated
@@ -165,6 +169,33 @@ in the latest repair ledger, before the default finalize pass.
 GigaFlex invokes the configured GigaCode CLI in the target workspace for every
 phase. Existing team skills, project rules, allowed tools, and GigaCode settings
 therefore remain available instead of being replaced by the runner.
+
+Skills that exchange generated files outside Git need an explicit artifact
+selection. For example, add this to `.gigaflex/config` for
+`openspec-ssot-runner`, keeping the same paths in the project's `.gitignore`:
+
+```ini
+[gigaflex]
+task_artifact_paths = graphify-out/ domain-out/ domains.json
+```
+
+Paths are literal files or directories relative to the execution repository;
+separate them with whitespace and quote paths containing spaces. Globs are not
+expanded. Only ignored, untracked files under those paths are copied. The
+default is an empty selection, so unrelated ignored files are not transferred.
+
+Each task receives its own copy of these inputs. After successful validation,
+artifact additions, edits, and deletions are installed in the execution checkout
+alongside the task commits, without adding the artifacts to Git's index or
+history. The next task receives that updated state. Concurrent changes to the
+checkout's artifacts reject promotion; an installation failure rolls back both
+the committed changes and the artifact changes. Selected ignored inputs must
+remain outside the task's commits. Empty directories are not preserved.
+
+Review and validation worktrees receive independent copies too. Changes to
+selected artifacts invalidate saved phase checks, and interrupted task recovery
+preserves both the original inputs and the task outputs. Keep the same
+`task_artifact_paths` when using `--resume`.
 
 Localized prose-only task sections such as `## Задача 1: ...` are also
 supported when an OpenSpec generator omits checkboxes. They start as pending;
@@ -552,6 +583,7 @@ worktree = false
 move_plan_on_completion = true
 commit_plan_on_creation = true
 allow_dirty = false
+# task_artifact_paths = graphify-out/ domain-out/ domains.json
 ```
 
 Leave `default_branch` empty to capture the branch checked out at launch. The

@@ -13,6 +13,19 @@ from gigaflex.prompts import DEFAULT_PROMPTS
 
 
 class ConfigTest(unittest.TestCase):
+    def test_loads_literal_task_artifact_paths(self) -> None:
+        self.assertEqual((), Config().task_artifact_paths)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config"
+            config.write_text(
+                '[gigaflex]\ntask_artifact_paths = graphify-out/ domain-out/ domains.json\n'
+                '    "output with spaces/100%"\n', encoding="utf-8",
+            )
+            self.assertEqual(
+                (Path('domain-out'), Path('domains.json'), Path('graphify-out'), Path('output with spaces/100%')),
+                load_config(config).task_artifact_paths,
+            )
+
     def test_loads_structured_validation_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config"

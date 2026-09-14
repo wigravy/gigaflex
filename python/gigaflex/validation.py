@@ -12,6 +12,7 @@ import tempfile
 import time
 
 from .git import GitService
+from .artifacts import ArtifactSnapshot
 
 
 @dataclass(frozen=True)
@@ -55,13 +56,18 @@ class RepositoryState:
     head: str
     tree: str
     index: str
+    artifacts: str = ""
 
 
-def repository_state(git: GitService, excluded: tuple[Path, ...] = ()) -> RepositoryState:
+def repository_state(
+    git: GitService, excluded: tuple[Path, ...] = (), artifact_paths: tuple[Path, ...] = (),
+) -> RepositoryState:
     index = git.run("write-tree").stdout.strip()
     with tempfile.TemporaryDirectory(prefix="gigaflex-state-") as temporary:
         snapshot = git.create_review_snapshot(Path(temporary) / "index", excluded, index_ref=index)
-    return RepositoryState(git.head_commit(), git.tree_id(snapshot), index)
+    artifacts = (ArtifactSnapshot.capture(git, artifact_paths, excluded_paths=excluded).signature()
+                 if artifact_paths else "")
+    return RepositoryState(git.head_commit(), git.tree_id(snapshot), index, artifacts)
 
 
 def run_validation(command: ValidationCommand, root: Path) -> dict[str, object]:

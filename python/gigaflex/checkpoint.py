@@ -8,6 +8,7 @@ import tempfile
 from typing import Callable
 
 from .git import GitService
+from .artifacts import ArtifactSnapshot
 
 
 CHECKPOINT_VERSION = 1
@@ -22,6 +23,7 @@ class ResumeError(RuntimeError):
 class RepositoryState:
     head: str
     tree: str
+    artifacts: str = ""
 
 
 class RunCheckpoint:
@@ -33,6 +35,7 @@ class RunCheckpoint:
         identity: str,
         base_commit: str,
         ignored_paths: tuple[Path, ...] = (),
+        artifact_paths: tuple[Path, ...] = (),
         diagnostic: Callable[[str], None] = lambda _line: None,
         restart: bool = False,
     ) -> None:
@@ -41,6 +44,7 @@ class RunCheckpoint:
         self.identity = identity
         self.base_commit = base_commit
         self.ignored_paths = ignored_paths
+        self.artifact_paths = artifact_paths
         self.diagnostic = diagnostic
         self._data = self._load()
         if restart:
@@ -85,13 +89,16 @@ class RunCheckpoint:
         return RepositoryState(
             head=self.git.head_commit(),
             tree=self.git.tree_id(snapshot),
+            artifacts=(ArtifactSnapshot.capture(self.git, self.artifact_paths, excluded_paths=self.ignored_paths).signature()
+                       if self.artifact_paths else ""),
         )
 
     def can_reuse(self, phase: str, state: RepositoryState) -> bool:
         value = self._phases().get(phase)
         if not isinstance(value, dict):
             return False
-        reusable = value.get("head") == state.head and value.get("tree") == state.tree
+        reusable = (value.get("head") == state.head and value.get("tree") == state.tree
+                    and value.get("artifacts", "") == state.artifacts)
         if reusable:
             self._report(
                 f"session=checkpoint event=reused phase={phase} head={state.head}"

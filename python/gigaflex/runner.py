@@ -827,7 +827,11 @@ class Runner:
         if self.dashboard is not None:
             excluded.extend((self.dashboard.json_path, self.dashboard.html_path))
         paths = tuple(path.resolve().relative_to(root) for path in excluded if path.resolve().is_relative_to(root))
-        return repository_state(git, paths)
+        return repository_state(git, paths, self._artifact_paths())
+
+    def _artifact_paths(self) -> tuple[Path, ...]:
+        manager = self.task_worktrees or self.review_worktrees
+        return manager.artifact_paths if manager is not None else ()
 
     def _assert_state(self, expected: Optional[RepositoryState], phase: str) -> None:
         if expected is not None and self._state() != expected:
@@ -842,7 +846,10 @@ class Runner:
             return []
         expected = self._state()
         if self._active_cwd is None and self.task_worktrees is not None:
-            manager = ReviewWorktreeManager(self._git())
+            manager = ReviewWorktreeManager(
+                self._git(), artifact_paths=self._artifact_paths(),
+                ignored_paths=self.task_worktrees.ignored_paths,
+            )
             with manager.create(["validation"], base_ref=self.options.default_branch) as worktrees:
                 root = worktrees.paths["validation"]
                 results = self._execute_checks(commands, root)
@@ -857,14 +864,13 @@ class Runner:
         return [f"{item['name']}: {item['status']} (exit {item['returncode']})\n{str(item['output'])[-4000:]}"
                 for item in results if item["status"] != "passed"]
 
-    @staticmethod
-    def _execute_checks(commands, root: Path) -> list[dict[str, object]]:
+    def _execute_checks(self, commands, root: Path) -> list[dict[str, object]]:
         git = GitService(root)
         results = []
         for command in commands:
-            before = repository_state(git)
+            before = repository_state(git, artifact_paths=self._artifact_paths())
             result = run_validation(command, root)
-            changed = repository_state(git) != before
+            changed = repository_state(git, artifact_paths=self._artifact_paths()) != before
             if changed:
                 result["status"] = "failed"
                 result["output"] = str(result["output"]) + "\nValidation command modified repository content or index."
@@ -960,7 +966,8 @@ class Runner:
                 protected = ({workspace.path / path.resolve().relative_to(workspace.repo_root): content
                               for path, content in original_protected.items()} if recovery else self._phase_protected())
                 tree = self._git().tree_id(workspace.snapshot_commit)
-                before = RepositoryState(workspace.snapshot_commit, tree, tree)
+                before = RepositoryState(workspace.snapshot_commit, tree, tree,
+                                         workspace.artifact_signature)
                 if recovery:
                     self._restore_phase_contract(protected)
                 completed = self._execute_synthesis(findings, before, protected)
@@ -1022,13 +1029,14 @@ class Runner:
             workspace.phase = "finalize"
             with self._use_task_workspace(workspace):
                 tree = self._git().tree_id(workspace.snapshot_commit)
-                before = RepositoryState(workspace.snapshot_commit, tree, tree)
+                before = RepositoryState(workspace.snapshot_commit, tree, tree,
+                                         workspace.artifact_signature)
                 protected = ({workspace.path / path.resolve().relative_to(workspace.repo_root): content
                               for path, content in original_protected.items()} if recovery else self._phase_protected())
                 result = self.finalize_executor.run(
                     render(self.options.prompts.finalize, self._context())
                     + "\nRunner verification boundary: inspect this fixed candidate without changing HEAD, "
-                    "the index, tracked files, plan, or non-ignored untracked files. "
+                    "the index, tracked files, plan, non-ignored untracked files, or configured task artifacts. "
                     "Report required repairs; do not implement them during final verification.\n",
                     cwd=workspace.path,
                 )
@@ -1648,12 +1656,12 @@ class Runner:
                 worktrees.repo_root,
                 worktrees.review_manifest,
             )
-            before = repository_state(GitService(worktree))
+            before = repository_state(GitService(worktree), artifact_paths=self._artifact_paths())
             result = self.review_agent_executor.run(
                 render_prompt(context),
                 cwd=worktree,
             )
-            if repository_state(GitService(worktree)) != before:
+            if repository_state(GitService(worktree), artifact_paths=self._artifact_paths()) != before:
                 raise RuntimeError("read-only review modified its isolated candidate")
             return result
 
@@ -1704,7 +1712,8 @@ class Runner:
                 )
                 for name, focus in agents.items()
             }
-            before = {name: repository_state(GitService(path)) for name, path in worktrees.paths.items()}
+            before = {name: repository_state(GitService(path), artifact_paths=self._artifact_paths())
+                      for name, path in worktrees.paths.items()}
             results = self.review_agent_executor.run_batch(
                 prompts,
                 workdirs=worktrees.paths,
@@ -1715,7 +1724,7 @@ class Runner:
                 workdirs=worktrees.paths,
             )
             for name, path in worktrees.paths.items():
-                if repository_state(GitService(path)) != before[name]:
+                if repository_state(GitService(path), artifact_paths=self._artifact_paths()) != before[name]:
                     raise RuntimeError(f"read-only reviewer {name} modified its isolated candidate")
             return results
 

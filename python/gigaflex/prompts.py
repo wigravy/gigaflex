@@ -471,7 +471,7 @@ required repairs so the runner can route them through repair and fresh review.
 Success requires:
 - all required validation commands pass
 - no known implementation, testing, artifact-validation, or review issue remains
-- HEAD, staged state, tracked files, plan/context, and non-ignored untracked files remain unchanged
+- HEAD, staged state, tracked files, plan/context, non-ignored untracked files, and configured task artifacts remain unchanged
 
 If final verification succeeds, briefly summarize the checks and output exactly this as the final non-empty line:
 <<<GIGAFLEX:FINALIZE_DONE>>>

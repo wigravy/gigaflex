@@ -7,11 +7,13 @@ import os
 from pathlib import Path
 import shlex
 import re
+import shutil
 from typing import TYPE_CHECKING
 import uuid
 
 from .git import GitError, GitService, TaskWorktree
 from .checkpoint import ResumeError
+from .artifacts import ArtifactSnapshot, artifact_paths
 
 if TYPE_CHECKING:
     from .git import TaskWorktreeManager
@@ -37,6 +39,7 @@ def workspace_record(workspace: TaskWorktree, label: str) -> dict[str, object]:
         "original_branch": workspace.original_branch,
         "phase": workspace.phase,
         "phase_context": workspace.phase_context,
+        "artifact_paths": [str(path) for path in workspace.manager.artifact_paths],
     }
 
 
@@ -61,6 +64,12 @@ def save_task_recovery(workspace: TaskWorktree, label: str, reason: str) -> Path
     recovery_dir = common_dir / "gigaflex" / "recovery" / recovery_id
     recovery_dir.mkdir(parents=True, mode=0o700)
     task_git = GitService(workspace.path)
+    if workspace.manager.artifact_paths:
+        if workspace.artifact_snapshot is None or workspace.artifact_snapshot.directory is None:
+            raise GitError("task artifact input snapshot is missing")
+        shutil.copytree(workspace.artifact_snapshot.directory, recovery_dir / "artifacts-input", symlinks=True)
+        ArtifactSnapshot.load(recovery_dir / "artifacts-input")
+        workspace.manager.capture_artifacts(task_git, recovery_dir / "artifacts-worktree")
     head = task_git.resolve_commit("HEAD")
     index_tree = task_git.run("write-tree").stdout.strip()
     index_commit = task_git.run(
@@ -124,7 +133,9 @@ def save_task_recovery(workspace: TaskWorktree, label: str, reason: str) -> Path
             "This task was not promoted. Inspect the recovered work before accepting it.\n"
             "The bundle requires the original base commit in manifest.json.\n"
             "It preserves task commits, staged state, tracked files, and non-ignored\n"
-            "untracked files. Ignored untracked and external files are not included.\n\n"
+            "untracked files. Configured ignored task artifacts are stored separately\n"
+            "in artifacts-input/ and artifacts-worktree/ and restored by --resume.\n"
+            "Other ignored untracked and external files are not included.\n\n"
             "Replace /path/to/new-recovery-worktree with a NEW directory. Run:\n\n"
             f"git -C {repo} fetch --no-tags {bundle_arg} {refspec}\n"
             f"git -C {repo} worktree add --detach /path/to/new-recovery-worktree {refs['worktree']}\n"
@@ -161,6 +172,8 @@ def restore_task_recovery(
                 raise ValueError(f"invalid saved {key}")
         if manager.git.current_branch() != manifest["original_branch"]:
             raise ValueError("execution branch changed since the task was saved")
+        if artifact_paths(Path(value) for value in manifest.get("artifact_paths", [])) != artifact_paths(manager.artifact_paths):
+            raise ValueError("task_artifact_paths changed since the task was saved")
         path = Path(manifest["original_worktree"]) if retained else root / "task"
         if retained:
             if not path.is_absolute() or not path.parent.name.startswith("gigaflex-task-"):
@@ -170,12 +183,18 @@ def restore_task_recovery(
                 raise ValueError("retained directory is not the original linked worktree")
             if _common_dir(retained_git) != _common_dir(manager.git):
                 raise ValueError("retained worktree belongs to another repository")
+        artifacts = None
+        if manager.artifact_paths:
+            if not retained:
+                shutil.copytree(directory / "artifacts-input", root / "artifacts-input", symlinks=True)
+            artifacts = ArtifactSnapshot.load(path.parent / "artifacts-input")
         workspace = TaskWorktree(
             manager, path, manager.repo_root, manifest["base_commit"], manifest["snapshot_commit"],
             frozenset(Path(value) for value in manifest["original_dirty_paths"]),
             original_index_tree=manifest["original_index_tree"],
             original_branch=manifest["original_branch"], resumed=True,
             phase=manifest.get("phase", "task"), phase_context=manifest.get("phase_context", {}),
+            artifact_snapshot=artifacts,
         )
         temporary_refs = []
         try:
@@ -204,6 +223,9 @@ def restore_task_recovery(
                     task_git = GitService(path)
                     task_git.run("reset", "--mixed", head)
                     task_git.run("read-tree", manifest["commits"]["index"])
+                    if manager.artifact_paths:
+                        saved_artifacts = ArtifactSnapshot.load(directory / "artifacts-worktree")
+                        saved_artifacts.install(path, (Path(name) for name in saved_artifacts.state))
                 except BaseException:
                     manager.git.remove_worktree(path)
                     raise

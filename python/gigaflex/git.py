@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 from typing import Callable, Iterable, Optional
 
+from .artifacts import ArtifactSnapshot, artifact_paths
+
 
 DATE_PREFIX_RE = re.compile(r"^[\d-]+")
 BRANCH_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -584,6 +586,8 @@ class ReviewWorktreeManager:
     git: GitService
     diagnostic: Callable[[str], None] = lambda _line: None
     temp_parent: Optional[Path] = None
+    artifact_paths: tuple[Path, ...] = ()
+    ignored_paths: tuple[Path, ...] = ()
 
     @property
     def repo_root(self) -> Path:
@@ -634,12 +638,17 @@ class _ReviewWorktreeContext:
                 f"commit={snapshot} workspaces={len(self.names)}"
             )
             review_manifest = self._create_review_context_file(snapshot)
+            artifacts = ArtifactSnapshot.capture(
+                self.manager.git, self.manager.artifact_paths,
+                self.root / "artifacts-input", self.manager.ignored_paths,
+            )
             paths: dict[str, Path] = {}
             for index, name in enumerate(self.names, start=1):
                 slug = worktree_dir_name(name)
                 path = self.root / f"{index:02d}-{slug}"
                 self.manager.git.add_detached_worktree(path, snapshot)
                 self.worktrees.append(path)
+                artifacts.install(path, (Path(name) for name in artifacts.state))
                 paths[name] = path
                 self.manager.report(
                     "session=review-worktree event=created "
@@ -777,6 +786,7 @@ class TaskWorktree:
     resumed: bool = False
     phase: str = "task"
     phase_context: dict[str, object] = field(default_factory=dict)
+    artifact_snapshot: Optional[ArtifactSnapshot] = None
     verified: bool = field(default=False, init=False)
     promoted: bool = field(default=False, init=False)
     recovery_path: Optional[Path] = field(default=None, init=False)
@@ -784,22 +794,37 @@ class TaskWorktree:
     def promote(self, task_head: str) -> list[str]:
         return self.manager.promote(self, task_head)
 
+    @property
+    def artifact_signature(self) -> str:
+        if self.manager.artifact_paths and self.artifact_snapshot is not None:
+            return self.artifact_snapshot.signature()
+        return ""
+
     def discard_verified(self) -> None:
         git = GitService(self.path)
         if git.head_commit() != self.snapshot_commit or git.is_dirty():
             raise GitError("cannot discard a verification workspace containing changes")
+        if self.artifact_snapshot is not None and self.manager.capture_artifacts(git).state != self.artifact_snapshot.state:
+            raise GitError("cannot discard a verification workspace containing artifact changes")
         self.manager._assert_main_unchanged(self, "verified.index")
         self.verified = True
 
 
 @dataclass
 class TaskWorktreeManager:
-    """Run a task against a snapshot and promote only its committed delta."""
+    """Promote a task's committed delta and explicitly selected ignored artifacts."""
 
     git: GitService
     diagnostic: Callable[[str], None] = lambda _line: None
     temp_parent: Optional[Path] = None
     ignored_paths: tuple[Path, ...] = ()
+    artifact_paths: tuple[Path, ...] = ()
+
+    def __post_init__(self) -> None:
+        self.artifact_paths = artifact_paths(self.artifact_paths)
+
+    def capture_artifacts(self, git: GitService, directory: Optional[Path] = None) -> ArtifactSnapshot:
+        return ArtifactSnapshot.capture(git, self.artifact_paths, directory, self.ignored_paths)
 
     @property
     def repo_root(self) -> Path:
@@ -821,6 +846,16 @@ class TaskWorktreeManager:
             parent = commit
         adopted_paths = sorted(touched_paths & set(workspace.original_dirty_paths))
 
+        artifact_directory = Path(tempfile.mkdtemp(prefix="artifacts-result-", dir=workspace.path.parent))
+        artifacts = self.capture_artifacts(task_git, artifact_directory)
+        artifact_changes = (
+            workspace.artifact_snapshot.changed_paths(artifacts)
+            if workspace.artifact_snapshot is not None else set()
+        )
+        for path in artifact_changes:
+            if any(path == tracked or path in tracked.parents or tracked in path.parents for tracked in touched_paths):
+                raise GitError(f"task artifact overlaps a committed change; keep the artifact ignored: {path}")
+
         self._assert_main_unchanged(workspace, "promotion-before.index")
         promotion_path = workspace.path.parent / "promotion"
         try:
@@ -833,14 +868,18 @@ class TaskWorktreeManager:
                     commits,
                     adopted_paths,
                 )
-            else:
+            elif commits:
                 promotion_git.cherry_pick_transaction(commits)
+            elif not artifact_changes:
+                raise GitError("task worktree produced no commits to promote")
             promoted_head = promotion_git.head_commit()
             self._assert_main_unchanged(workspace, "promotion-after.index")
             self._install_promoted_head(
                 workspace,
                 promoted_head,
                 touched_paths,
+                artifacts,
+                artifact_changes,
             )
             workspace.promoted = True
         finally:
@@ -856,7 +895,7 @@ class TaskWorktreeManager:
             )
         self.report(
             "session=task-worktree event=promoted "
-            f"commits={len(commits)} head={self.git.head_commit()}"
+            f"commits={len(commits)} head={self.git.head_commit()} artifacts={len(artifact_changes)}"
         )
         return commits
 
@@ -905,6 +944,8 @@ class TaskWorktreeManager:
         workspace: TaskWorktree,
         promoted_head: str,
         touched_paths: set[Path],
+        artifacts: ArtifactSnapshot,
+        artifact_changes: set[Path],
     ) -> None:
         index_path = self.git.index_path()
         index_backup = workspace.path.parent / "main.index.backup"
@@ -921,6 +962,7 @@ class TaskWorktreeManager:
             )
             head_updated = True
             self.git.replace_paths_from_ref(promoted_head, touched_paths)
+            artifacts.install(workspace.repo_root, artifact_changes)
         except BaseException as install_error:
             rollback_errors: list[str] = []
             if head_updated:
@@ -939,6 +981,11 @@ class TaskWorktreeManager:
                 )
             except (OSError, GitError) as exc:
                 rollback_errors.append(f"working tree: {exc}")
+            try:
+                if workspace.artifact_snapshot is not None:
+                    workspace.artifact_snapshot.install(workspace.repo_root, artifact_changes)
+            except (OSError, ValueError) as exc:
+                rollback_errors.append(f"artifacts: {exc}")
             finally:
                 try:
                     if had_index:
@@ -961,6 +1008,8 @@ class TaskWorktreeManager:
         workspace: TaskWorktree,
         index_name: str,
     ) -> None:
+        if workspace.artifact_snapshot is not None and self.capture_artifacts(self.git).state != workspace.artifact_snapshot.state:
+            raise GitError("main task artifacts changed while the isolated task was running; task commits were not promoted")
         if workspace.original_index_tree and self.git.run("write-tree").stdout.strip() != workspace.original_index_tree:
             raise GitError("main index changed while the isolated task was running")
         if self.git.head_commit() != workspace.base_commit:
@@ -1045,6 +1094,8 @@ class _TaskWorktreeContext:
             path = self.root / worktree_dir_name(self.label)
             self.path = path
             self.manager.git.add_detached_worktree(path, snapshot)
+            artifacts = self.manager.capture_artifacts(self.manager.git, self.root / "artifacts-input")
+            artifacts.install(path, (Path(name) for name in artifacts.state))
             self.manager.report(
                 "session=task-worktree event=created "
                 f"path={str(path)!r} base={base_commit} snapshot={snapshot} "
@@ -1059,6 +1110,7 @@ class _TaskWorktreeContext:
                 original_dirty_paths=original_dirty_paths,
                 original_index_tree=self.manager.git.run("write-tree").stdout.strip(),
                 original_branch=self.manager.git.current_branch(),
+                artifact_snapshot=artifacts,
             )
             return self.workspace
         except BaseException:

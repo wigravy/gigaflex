@@ -959,7 +959,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     review_worktrees = (
         None
         if args.dry_run
-        else ReviewWorktreeManager(git, diagnostic=log.diagnostic)
+        else ReviewWorktreeManager(git, diagnostic=log.diagnostic, artifact_paths=cfg.task_artifact_paths)
     )
     repo_root = git.repo_root() if not args.dry_run else None
     orchestration_paths = (
@@ -985,11 +985,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             git,
             diagnostic=log.diagnostic,
             ignored_paths=orchestration_paths,
+            artifact_paths=cfg.task_artifact_paths,
         )
     )
+    if review_worktrees is not None:
+        review_worktrees.ignored_paths = orchestration_paths
     try:
         checkpoint = make_checkpoint(
             args, checkpoint_file, git, plan_source, run_baseline, orchestration_paths, log,
+            artifact_paths=cfg.task_artifact_paths,
         )
     except ResumeError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1117,7 +1121,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
-def make_checkpoint(args, path, git, plan_source, baseline, ignored_paths, log):
+def make_checkpoint(args, path, git, plan_source, baseline, ignored_paths, log, *, artifact_paths=()):
     if args.dry_run:
         return None
     return RunCheckpoint(
@@ -1126,6 +1130,7 @@ def make_checkpoint(args, path, git, plan_source, baseline, ignored_paths, log):
                   if plan_source is not None else f"review:{git.current_branch()}"),
         base_commit=baseline.base_commit if baseline is not None else "",
         ignored_paths=ignored_paths, diagnostic=log.diagnostic,
+        artifact_paths=artifact_paths,
         restart=args.restart,
     )
 

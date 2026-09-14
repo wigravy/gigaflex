@@ -11,6 +11,7 @@ from .defaults import DEFAULT_GIGACODE_ARGS, DEFAULT_GIGACODE_INTERACTIVE_ARGS
 from .executor import DEFAULT_RATE_LIMIT_PATTERNS, DEFAULT_TRANSIENT_RETRY_PATTERNS
 from .prompts import init_prompt_templates, sync_global_prompt_templates
 from .validation import ValidationCommand, parse_validation_commands
+from .artifacts import artifact_paths
 
 
 GLOBAL_CONFIG_RELATIVE_DIR = Path(".config/gigaflex")
@@ -51,6 +52,7 @@ class Config:
     commit_plan_on_creation: bool = True
     allow_dirty: bool = False
     validation_commands: tuple[ValidationCommand, ...] = ()
+    task_artifact_paths: tuple[Path, ...] = ()
 
     @property
     def resolved_args(self) -> list[str]:
@@ -153,6 +155,10 @@ def load_config(path: Optional[Path] = None) -> Config:
     cfg.move_plan_on_completion = section.getboolean("move_plan_on_completion", cfg.move_plan_on_completion)
     cfg.commit_plan_on_creation = section.getboolean("commit_plan_on_creation", cfg.commit_plan_on_creation)
     cfg.allow_dirty = section.getboolean("allow_dirty", cfg.allow_dirty)
+    if "task_artifact_paths" in section:
+        cfg.task_artifact_paths = artifact_paths(
+            Path(value) for value in shlex.split(section.get("task_artifact_paths", raw=True))
+        )
     if "validation_commands" in section:
         cfg.validation_commands = parse_validation_commands(section.get("validation_commands", raw=True))
     return _apply_env(cfg)
@@ -293,6 +299,7 @@ DEFAULT_CONFIG_TEXT = """[gigaflex]
 # move_plan_on_completion = true
 # commit_plan_on_creation = true
 # allow_dirty = false
+# task_artifact_paths = graphify-out/ domain-out/ domains.json
 """
 
 
